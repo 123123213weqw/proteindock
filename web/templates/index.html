@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ProteinDock · 蛋白质-小分子对接平台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">PD</span>
+    <div class="brand-text">
+      <h1>ProteinDock <small>蛋白质-小分子对接平台</small></h1>
+      <p>深度学习打分 · 混合构象搜索 · 交互式 3D 可视化</p>
+    </div>
+  </div>
+  <div class="topmeta">
+    <span id="version-badge" class="badge">v1.0</span>
+    <span id="device-badge" class="badge gpu">GPU</span>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左侧: 输入与参数 -->
+  <section class="panel input-panel">
+    <h2>对接任务</h2>
+    <div class="tabs">
+      <button class="tab active" data-tab="example">内置示例</button>
+      <button class="tab" data-tab="upload">上传文件</button>
+    </div>
+
+    <div id="tab-example" class="tab-body">
+      <label>选择示例体系</label>
+      <select id="example-select" size="5"></select>
+    </div>
+
+    <div id="tab-upload" class="tab-body hidden">
+      <label>蛋白质结构 (PDB)</label>
+      <div class="dropzone" id="drop-receptor">
+        <input type="file" id="file-receptor" accept=".pdb" hidden>
+        <span class="dz-hint">点击或拖入 .pdb 文件</span>
+        <span class="dz-name" id="name-receptor"></span>
+      </div>
+      <label>配体分子 (SDF / MOL2)</label>
+      <div class="dropzone" id="drop-ligand">
+        <input type="file" id="file-ligand" accept=".sdf,.mol2,.pdb" hidden>
+        <span class="dz-hint">点击或拖入配体文件</span>
+        <span class="dz-name" id="name-ligand"></span>
+      </div>
+    </div>
+
+    <h2>搜索参数</h2>
+    <div class="form-grid">
+      <label>搜索策略
+        <select id="param-method">
+          <option value="hybrid" selected>混合(GA+MC-SA)</option>
+          <option value="mc_sa">蒙特卡洛模拟退火</option>
+          <option value="ga">遗传算法</option>
+        </select>
+      </label>
+      <label>独立搜索次数
+        <input type="number" id="param-exhaustiveness" value="8"
+               min="1" max="64" step="1">
+      </label>
+      <label>盒子边长 (Å)
+        <input type="number" id="param-box" value="24" min="16" max="40" step="2">
+      </label>
+      <label>DL 打分权重
+        <input type="number" id="param-dlweight" value="1.0" min="0" max="3" step="0.1">
+      </label>
+      <label class="wide">口袋中心 (留空自动检测, 格式 x,y,z)
+        <input type="text" id="param-pocket" placeholder="例如 12.3,45.6,78.9">
+      </label>
+    </div>
+
+    <button id="btn-submit" class="primary">开始对接</button>
+
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-label">
+        <span id="progress-stage">就绪</span>
+        <span id="progress-pct">0%</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+      <p class="progress-msg" id="progress-msg"></p>
+    </div>
+  </section>
+
+  <!-- 中间: 3D 视图 -->
+  <section class="panel viewer-panel">
+    <div class="viewer-head">
+      <h2>3D 结构视图</h2>
+      <div class="viewer-controls">
+        <button id="view-cartoon" class="chip active">Cartoon</button>
+        <button id="view-stick" class="chip">Stick</button>
+        <button id="view-surface" class="chip">Surface</button>
+        <button id="view-reset" class="chip">重置视角</button>
+      </div>
+    </div>
+    <div id="viewer"></div>
+    <div class="viewer-legend">
+      <span><i class="dot lig"></i>对接配体 pose</span>
+      <span><i class="dot poc"></i>口袋残基</span>
+    </div>
+  </section>
+
+  <!-- 右侧: 结果 -->
+  <section class="panel result-panel">
+    <h2>对接结果</h2>
+    <table class="result-table" id="result-table">
+      <thead>
+        <tr><th>#</th><th>经验分</th><th>DL 分</th><th>融合分</th><th>簇</th></tr>
+      </thead>
+      <tbody><tr class="empty-row"><td colspan="5">暂无结果, 请提交任务</td></tr></tbody>
+    </table>
+
+    <h2>能量分解 <small id="energy-pose-label"></small></h2>
+    <canvas id="energy-canvas" width="360" height="220"></canvas>
+    <p class="muted small">经验打分通道的五项能量分解 (kcal/mol)</p>
+
+    <h2>深度学习模型</h2>
+    <div id="model-summary" class="muted small">未加载 EGNN 模型(纯经验打分模式)</div>
+    <canvas id="loss-canvas" width="360" height="180" class="hidden"></canvas>
+
+    <h2>运行信息</h2>
+    <div id="stats-box" class="stats muted small">等待任务...</div>
+  </section>
+</main>
+
+<footer>
+  ProteinDock v1.0 · 温州大学大学生创新创业训练计划项目 ·
+  EGNN 深度学习打分 / MC-SA + GA 混合搜索 / Vina 式经验打分
+</footer>
+
+<script src="/static/3dmol.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

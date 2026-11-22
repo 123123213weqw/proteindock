@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+web_jobs/
+datasets/
+models/*.pt
+out_*/
+*.log
+.DS_Store

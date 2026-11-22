@@ -1,0 +1,3136 @@
+
+基于深度学习打分的蛋白质-小分子对接平台软件
+源 程 序
+
+软件名称: 基于深度学习打分的蛋白质-小分子对接平台软件
+版本号: V1.0
+共 3613 行 / 73 页
+本文件包含前 30 页与后 30 页源程序
+生成日期: 2026-11-22
+===============================================================
+
+/* ====== 文件: proteindock/__init__.py ====== */
+# -*- coding: utf-8 -*-
+"""ProteinDock —— 基于深度学习打分的蛋白质-小分子对接平台
+
+ ProteinDock 集成多种前沿技术完成蛋白质-小分子柔性对接:
+   1. 蒙特卡洛模拟退火(MC-SA)与遗传算法(GA)混合构象搜索
+   2. Vina 式多项物理经验打分函数(高斯/静电/氢键/疏水项)
+   3. 打分网格预计算加速(0.375 A 间距)
+   4. E(n) 等变图神经网络(EGNN)深度学习打分与 pose 重排序
+   5. Flask + WebGL(3Dmol.js) 交互式可视化平台与命令行双模式
+
+ :author: 温州大学大学生创新创业训练计划项目组
+ :license: MIT
+"""
+
+__version__ = "1.0.0"
+__title__ = "ProteinDock"
+__description__ = "基于深度学习打分的蛋白质-小分子对接平台"
+__all__ = [
+    "chemistry",
+    "io",
+    "scoring",
+    "search",
+    "dl",
+    "pipeline",
+    "cli",
+]
+
+/* ====== 文件: proteindock/chemistry/elements.py ====== */
+# -*- coding: utf-8 -*-
+"""元素周期参数表
+
+ 提供常见生物体系元素的范德华半径、相对原子质量与 Pauling 电负性,
+ 供原子分型、碰撞检测与打分函数使用。
+"""
+
+# 元素符号 -> (vdW 半径 /A, 相对原子质量, 电负性)
+ELEMENT_TABLE = {
+    "H": (1.10, 1.008, 2.20),
+[第 1 页]
+
+    "B": (1.92, 10.811, 2.04),
+    "C": (1.70, 12.011, 2.55),
+    "N": (1.55, 14.007, 3.04),
+    "O": (1.52, 15.999, 3.44),
+    "F": (1.47, 18.998, 3.98),
+    "SI": (2.10, 28.085, 1.90),
+    "P": (1.80, 30.974, 2.19),
+    "S": (1.80, 32.060, 2.58),
+    "CL": (1.75, 35.450, 3.16),
+    "BR": (1.85, 79.904, 2.96),
+    "I": (1.98, 126.904, 2.66),
+    # 常见金属离子(仅用于蛋白侧建模体识别)
+    "MN": (2.05, 54.938, 1.55),
+    "FE": (2.05, 55.845, 1.83),
+    "ZN": (2.10, 65.380, 1.65),
+    "CU": (2.00, 63.546, 1.90),
+    "MG": (2.05, 24.305, 1.31),
+    "CA": (2.30, 40.078, 1.00),
+    "NA": (2.30, 22.990, 0.93),
+    "K": (2.80, 39.098, 0.82),
+}
+
+# 支持参与对接打分的重元素(不含氢: Vina 式打分使用非氢原子表示)
+DOCKABLE_ELEMENTS = set(ELEMENT_TABLE) - {"H"}
+
+
+def normalize_element(symbol: str) -> str:
+    """把 PDB/SDF 中可能出现的元素写法统一为大写规范形式。
+
+    :param symbol: 原始元素符号, 如 "c", "CA", "Cl"
+    :return: 规范化元素符号, 未知元素返回 "C" 并保持兼容
+    """
+    sym = symbol.strip().upper()
+    if sym in ELEMENT_TABLE:
+        return sym
+    # 尝试首字母匹配(例如 "c1" 之类的 aromatic 标记已在上游剥离)
+    if sym[:1] in ELEMENT_TABLE:
+        return sym[:1]
+    return "C"
+
+
+def vdw_radius(element: str) -> float:
+    """返回元素范德华半径, 未知元素回退为碳的半径。"""
+    return ELEMENT_TABLE.get(normalize_element(element), ELEMENT_TABLE["C"])[0]
+
+
+def atomic_mass(element: str) -> float:
+    """返回元素相对原子质量。"""
+    return ELEMENT_TABLE.get(normalize_element(element), ELEMENT_TABLE["C"])[1]
+
+[第 2 页]
+
+
+def electronegativity(element: str) -> float:
+    """返回元素 Pauling 电负性, 用于氢键供受体判定。"""
+    return ELEMENT_TABLE.get(normalize_element(element), ELEMENT_TABLE["C"])[2]
+
+/* ====== 文件: proteindock/chemistry/atom_types.py ====== */
+# -*- coding: utf-8 -*-
+"""AutoDock/Vina 风格的原子分型
+
+ 把蛋白质与配体重原子划分为 16 种打分类型, 每种类型携带一组
+ 打分函数系数(高斯 1 / 高斯 2 / 斥力 / 疏水 / 氢键),
+ 与 scoring.vina_sf 配合完成原子对相互作用计算。
+
+ 类型说明:
+   C_H  脂肪族疏水碳      C_A  芳香碳           C    其他脂肪碳
+   N_D  氢键供体氮        NA   氢键受体氮        N    中性氮
+   OA   受体氧(羟基/羰基) O    中性氧
+   S    疏水硫            SA   受体硫            P    磷
+   F/CL/BR/I 卤素         MET  金属离子
+"""
+
+from .elements import normalize_element
+
+# 全部打分类型(顺序即 one-hot 编码顺序)
+ATOM_TYPES = [
+    "C_H", "C_A", "C", "N", "N_D", "NA", "O", "OA",
+    "S", "SA", "P", "F", "CL", "BR", "I", "MET",
+]
+TYPE_INDEX = {t: i for i, t in enumerate(ATOM_TYPES)}
+
+# 氢键供体 / 受体类型集合
+DONOR_TYPES = {"N_D"}
+ACCEPTOR_TYPES = {"NA", "OA", "SA"}
+
+# 芳香残基侧链中构成共轭环的原子名
+AROMATIC_RING_ATOMS = {
+    "PHE": {"CG", "CD1", "CD2", "CE1", "CE2", "CZ"},
+    "TYR": {"CG", "CD1", "CD2", "CE1", "CE2", "CZ"},
+    "TRP": {"CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"},
+    "HIS": {"CG", "ND1", "CD2", "CE1", "NE2"},
+}
+
+# 疏水性残基(其侧链碳按 C_H 处理)
+HYDROPHOBIC_RESIDUES = {"ALA", "VAL", "LEU", "ILE", "PRO", "MET", "PHE", "TRP"}
+
+# 每种类型的 5 维系数: (gauss1, gauss2, repulsion, hydrophobic, hbond)
+# 取值参考 AutoDock Vina 1.1.2 打分函数原子对系数的典型量级
+TYPE_COEFFICIENTS = {
+    "C_H": (0.60, 0.30, 1.00, 1.00, 0.00),
+    "C_A": (0.60, 0.30, 1.00, 0.70, 0.00),
+[第 3 页]
+
+    "C":   (0.50, 0.25, 1.00, 0.40, 0.00),
+    "N":   (0.50, 0.25, 1.00, 0.00, 0.20),
+    "N_D": (0.50, 0.25, 1.10, 0.00, 1.00),
+    "NA":  (0.50, 0.25, 1.10, 0.00, 1.00),
+    "O":   (0.45, 0.25, 1.10, 0.00, 0.30),
+    "OA":  (0.45, 0.25, 1.10, 0.00, 1.00),
+    "S":   (0.60, 0.30, 1.00, 0.90, 0.00),
+    "SA":  (0.60, 0.30, 1.10, 0.70, 0.40),
+    "P":   (0.50, 0.25, 1.10, 0.20, 0.20),
+    "F":   (0.45, 0.25, 0.90, 0.20, 0.30),
+    "CL":  (0.60, 0.30, 1.00, 0.55, 0.20),
+    "BR":  (0.65, 0.30, 1.05, 0.60, 0.20),
+    "I":   (0.70, 0.35, 1.10, 0.65, 0.20),
+    "MET": (0.50, 0.25, 1.20, 0.00, 0.10),
+}
+
+METAL_ELEMENTS = {"MN", "FE", "ZN", "CU", "MG", "CA", "NA", "K"}
+
+
+def pair_coefficients(type_a: str, type_b: str):
+    """返回原子对 (a,b) 的 5 维打分系数。
+
+    规则: gauss/repulsion 取两者均值;
+          hydrophobic 仅在双方均为疏水类型时取均值, 否则为 0;
+          hbond 仅在双方构成供体-受体对时取均值, 否则为 0。
+    """
+    ca = TYPE_COEFFICIENTS[type_a]
+    cb = TYPE_COEFFICIENTS[type_b]
+    g1 = (ca[0] + cb[0]) / 2.0
+    g2 = (ca[1] + cb[1]) / 2.0
+    rep = (ca[2] + cb[2]) / 2.0
+    hydro = (ca[3] + cb[3]) / 2.0 if (ca[3] > 0 and cb[3] > 0) else 0.0
+    hb = (ca[4] + cb[4]) / 2.0 if (ca[4] > 0 and cb[4] > 0) else 0.0
+    return g1, g2, rep, hydro, hb
+
+
+def assign_protein_type(element: str, atom_name: str, resname: str) -> str:
+    """蛋白质重原子的启发式分型(不依赖外部工具, 只看元素/原子名/残基名)。
+
+    :param element: 元素符号
+    :param atom_name: PDB 原子名, 如 "CB", "OD1", "NZ"
+    :param resname: 残基名三字母码, 如 "ALA", "HIS"
+    :return: ATOM_TYPES 中的类型字符串
+    """
+    el = normalize_element(element)
+    name = atom_name.strip().upper()
+    res = resname.strip().upper()
+
+    if el in METAL_ELEMENTS:
+        return "MET"
+[第 4 页]
+
+    if el == "C":
+        ring = AROMATIC_RING_ATOMS.get(res)
+        if ring and name in ring:
+            return "C_A"
+        if res in HYDROPHOBIC_RESIDUES and name.startswith(("C", "S")):
+            return "C_H"
+        if name in ("CB", "CG", "CD", "CE", "CZ") or name.startswith(("CD", "CE", "CG")):
+            # 侧链脂肪碳: 亲水残基记为普通 C
+            return "C_H" if res in ("ALA", "VAL", "LEU", "ILE", "PRO") else "C"
+        return "C"
+    if el == "N":
+        if res == "HIS" and name in ("ND1", "NE2"):
+            return "NA"
+        if res == "LYS" and name == "NZ":
+            return "N_D"
+        if res == "ARG" and name in ("NE", "NH1", "NH2"):
+            return "N_D"
+        if res == "TRP" and name == "NE1":
+            return "N_D"
+        return "N"
+    if el == "O":
+        return "OA"
+    if el == "S":
+        return "S" if res == "MET" else "SA"
+    if el == "P":
+        return "P"
+    if el == "F":
+        return "F"
+    if el == "CL":
+        return "CL"
+    if el == "BR":
+        return "BR"
+    if el == "I":
+        return "I"
+    return "C"
+
+/* ====== 文件: proteindock/chemistry/geometry.py ====== */
+# -*- coding: utf-8 -*-
+"""刚体几何运算: 四元数、旋转平移变换与 RMSD
+
+ 对接搜索中配体的姿态(pose)由「平移向量 + 单位四元数 + 可旋转键扭转角」
+ 参数化。使用四元数而非欧拉角可以避免万向节锁, 且数值更稳定。
+"""
+
+import numpy as np
+
+
+# ---------------------------------------------------------------- 四元数工具
+def quaternion_identity() -> np.ndarray:
+    """单位四元数 (w, x, y, z)。"""
+[第 5 页]
+
+    return np.array([1.0, 0.0, 0.0, 0.0])
+
+
+def random_quaternion(rng: np.random.Generator) -> np.ndarray:
+    """均匀采样 SO(3) 上的单位四元数 (Shoemake 方法)。"""
+    u1, u2, u3 = rng.random(3)
+    q = np.array([
+        np.sqrt(1.0 - u1) * np.sin(2.0 * np.pi * u2),
+        np.sqrt(1.0 - u1) * np.cos(2.0 * np.pi * u2),
+        np.sqrt(u1) * np.sin(2.0 * np.pi * u3),
+        np.sqrt(u1) * np.cos(2.0 * np.pi * u3),
+    ])
+    return q / np.linalg.norm(q)
+
+
+def quaternion_normalize(q: np.ndarray) -> np.ndarray:
+    """把四元数归一化为单位四元数。"""
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return quaternion_identity()
+    return q / n
+
+
+def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """四元数乘法 q1 * q2。"""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+
+
+def quaternion_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """用四元数旋转向量或向量组。
+
+    :param q: 单位四元数 (w,x,y,z)
+    :param v: (3,) 或 (N,3) 坐标数组
+    :return: 旋转后同形状坐标数组
+    """
+    v = np.asarray(v, dtype=np.float64)
+    single = v.ndim == 1
+    pts = np.atleast_2d(v)
+    w, x, y, z = q
+    # 旋转矩阵
+    rot = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+[第 6 页]
+
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+    out = pts @ rot.T
+    return out[0] if single else out
+
+
+def quaternion_to_matrix(q: np.ndarray) -> np.ndarray:
+    """四元数转 3x3 旋转矩阵。"""
+    return quaternion_rotate(q, np.eye(3)).T
+
+
+def small_random_quaternion(rng: np.random.Generator, max_angle_rad: float) -> np.ndarray:
+    """在当前姿态附近采样一个随机小旋转(轴均匀, 角度上限给定)。"""
+    axis = rng.normal(size=3)
+    axis /= max(np.linalg.norm(axis), 1e-12)
+    angle = rng.uniform(0.0, max_angle_rad)
+    half = angle / 2.0
+    q = np.array([np.cos(half), *(np.sin(half) * axis)])
+    return quaternion_normalize(q)
+
+
+# ---------------------------------------------------------------- 刚体变换
+class RigidTransform:
+    """平移 + 旋转构成的刚体变换, 作用于质心坐标系最为方便。"""
+
+    __slots__ = ("translation", "rotation_q")
+
+    def __init__(self, translation=None, rotation_q=None):
+        self.translation = np.zeros(3) if translation is None else np.asarray(translation, float)
+        self.rotation_q = quaternion_identity() if rotation_q is None else np.asarray(rotation_q, float)
+
+    def apply(self, coords: np.ndarray) -> np.ndarray:
+        """对以质心为原点的坐标组施加变换。"""
+        return quaternion_rotate(self.rotation_q, coords) + self.translation
+
+    def compose(self, d_translation: np.ndarray, d_rotation: np.ndarray) -> None:
+        """在当前变换上叠加一个小扰动(先旋转后平移)。"""
+        self.rotation_q = quaternion_normalize(
+            quaternion_multiply(d_rotation, self.rotation_q))
+        self.translation = self.translation + d_translation
+
+
+def centered(coords: np.ndarray) -> np.ndarray:
+    """返回以质心为原点的坐标副本。"""
+    return coords - coords.mean(axis=0)
+
+
+# ---------------------------------------------------------------- RMSD
+def rmsd(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
+    """直接 RMSD(未做叠合), 用于对接构象与晶体构象比较。"""
+[第 7 页]
+
+    diff = np.asarray(coords_a) - np.asarray(coords_b)
+    return float(np.sqrt((diff ** 2).sum() / max(len(diff), 1)))
+
+
+def kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
+    """Kabsch 叠合后最小 RMSD, 忽略整体朝向差异。"""
+    Pc = centered(P)
+    Qc = centered(Q)
+    H = Pc.T @ Qc
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    D = np.diag([1.0, 1.0, d])
+    R = Vt.T @ D @ U.T
+    prot = Pc @ R.T
+    return rmsd(prot, Qc)
+
+/* ====== 文件: proteindock/io/protein.py ====== */
+# -*- coding: utf-8 -*-
+"""蛋白质结构输入输出
+
+ 解析 PDB 文件的标准氨基酸重原子, 完成原子分型;
+ 提供基于占据空间分析的口袋检测(盲对接时自动寻找最大空腔)。
+"""
+
+from dataclasses import dataclass, field
+import numpy as np
+
+from ..chemistry.atom_types import (
+    ATOM_TYPES,
+    TYPE_INDEX,
+    assign_protein_type,
+)
+from ..chemistry.elements import normalize_element, vdw_radius
+
+STANDARD_RESIDUES = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS",
+    "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP",
+    "TYR", "VAL", "ASH", "GLH", "HID", "HIE", "HIP", "CYX",
+}
+
+
+@dataclass
+class Protein:
+    """蛋白质结构对象(重原子表示)。"""
+
+    coords: np.ndarray          # (N,3) 原子坐标
+    types: list                 # (N,) 打分类型字符串
+    type_ids: np.ndarray        # (N,) 类型索引
+    elements: list              # (N,) 元素符号
+    atom_names: list            # (N,) PDB 原子名
+[第 8 页]
+
+    res_names: list             # (N,) 残基名
+    res_ids: list               # (N,) 残基编号
+    chains: list                # (N,) 链标识
+    source: str = ""            # 来源文件
+
+    @property
+    def n_atoms(self) -> int:
+        return len(self.coords)
+
+    def centroid(self) -> np.ndarray:
+        return self.coords.mean(axis=0)
+
+    def pocket_atoms_mask(self, center: np.ndarray, radius: float = 10.0) -> np.ndarray:
+        """返回距口袋中心 radius 以内的原子布尔掩码。"""
+        d2 = ((self.coords - np.asarray(center)) ** 2).sum(axis=1)
+        return d2 <= radius * radius
+
+    def write_pdb(self, path: str) -> None:
+        """把蛋白质(通常为加氢前后处理版本)写回 PDB。"""
+        with open(path, "w", encoding="utf-8") as fh:
+            for i in range(self.n_atoms):
+                x, y, z = self.coords[i]
+                fh.write(
+                    "ATOM  {:5d} {:>4s} {:3s} {:1s}{:4d}    "
+                    "{:8.3f}{:8.3f}{:8.3f}  1.00  0.00          {:>2s}\n".format(
+                        i + 1, self.atom_names[i], self.res_names[i],
+                        self.chains[i], int(self.res_ids[i]), x, y, z,
+                        self.elements[i],
+                    )
+                )
+            fh.write("TER\nEND\n")
+
+
+def parse_pdb(path: str, keep_hetero: bool = False) -> Protein:
+    """解析 PDB 文件, 提取标准氨基酸重原子(可选保留 HETATM 中的非水杂原子)。
+
+    :param path: PDB 文件路径
+    :param keep_hetero: 是否保留金属等 HETATM 记录(忽略水与常见辅因子)
+    :return: Protein 对象
+    """
+    coords, types, elements = [], [], []
+    atom_names, res_names, res_ids, chains = [], [], [], []
+    skip_res = {"HOH", "WAT", "DOD", "SOL", "HEM", "NAG", "MAN", "SO4", "PO4", "GOL"}
+
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            rec = line[:6].strip()
+            if rec not in ("ATOM", "HETATM"):
+                continue
+            res = line[17:20].strip().upper()
+[第 9 页]
+
+            if rec == "HETATM":
+                if not keep_hetero or res in skip_res:
+                    continue
+            elif res not in STANDARD_RESIDUES:
+                continue
+            name = line[12:16].strip()
+            element = line[76:78].strip()
+            if not element:
+                # 依据原子名推断元素
+                element = "".join(ch for ch in name if ch.isalpha())[:1]
+            element = normalize_element(element)
+            if element == "H":
+                continue
+            x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+            chain = line[21].strip() or "A"
+            try:
+                res_id = int(line[22:26])
+            except ValueError:
+                res_id = 0
+            coords.append([x, y, z])
+            types.append(assign_protein_type(element, name, res))
+            elements.append(element)
+            atom_names.append(name)
+            res_names.append(res)
+            res_ids.append(res_id)
+            chains.append(chain)
+
+    if not coords:
+        raise ValueError("PDB 文件中未找到可用原子: {}".format(path))
+
+    return Protein(
+        coords=np.array(coords, dtype=np.float64),
+        types=types,
+        type_ids=np.array([TYPE_INDEX[t] for t in types], dtype=np.int64),
+        elements=elements,
+        atom_names=atom_names,
+        res_names=res_names,
+        res_ids=res_ids,
+        chains=chains,
+        source=path,
+    )
+
+
+# ---------------------------------------------------------------- 口袋检测
+def detect_pocket(protein: Protein, spacing: float = 1.0,
+                  probe_radius: float = 1.6, min_dirs: int = 3) -> np.ndarray:
+    """LigSite 风格的口袋检测(盲对接)。
+
+    原理(Hendlich et al., 1997):
+      1. 把蛋白包围盒体素化为 occupied(被重原子+探针半径覆盖)/free;
+[第 10 页]
+
+      2. 沿 ±x/±y/±z 六个方向扫描, 一个 free 体素若在某方向上
+         一侧遇到蛋白、另一侧通向外部溶剂, 则该方向记为" pocket ";
+      3. 六个方向的 pocket 计数 >= min_dirs 的体素构成结合口袋
+         (表面凹陷被多方向夹住, 而蛋白内部空隙两侧都是蛋白、
+          平坦表面几乎不被夹住);
+      4. 返回最高得分体素簇的质心。
+
+    :return: 口袋中心坐标 (3,)
+    """
+    coords = protein.coords
+    pad = 2.5
+    lo = coords.min(axis=0) - pad
+    hi = coords.max(axis=0) + pad
+    n_cells = np.ceil((hi - lo) / spacing).astype(int) + 1
+    if float(np.prod(n_cells)) > 6e6:            # 超大蛋白保护
+        spacing = float(np.cbrt(np.prod(hi - lo) / 2e6))
+        n_cells = np.ceil((hi - lo) / spacing).astype(int) + 1
+
+    # 体素化: 最近重原子距离 < vdW + probe 即占用(KD-tree 加速)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(coords)
+    axis_pts = [lo[i] + np.arange(n_cells[i]) * spacing for i in range(3)]
+    gx, gy, gz = np.meshgrid(*axis_pts, indexing="ij")
+    vox = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+    nearest, _ = tree.query(vox, k=1)
+    mean_vdw = float(np.mean([vdw_radius(e) for e in protein.elements]))
+    occ = (nearest <= mean_vdw + probe_radius).reshape(tuple(n_cells))
+    free = ~occ
+
+    # 六方向 LigSite 扫描: free 体素在某方向上两侧均被蛋白夹住
+    pocket_votes = np.zeros_like(free, dtype=np.int8)
+    for axis in range(3):
+        cum = np.cumsum(occ, axis=axis)
+        tot_idx = [slice(None)] * 3
+        tot_idx[axis] = slice(-1, None)
+        total = cum[tuple(tot_idx)]              # 该轴占用总数(axis 维为 1)
+        before = cum - occ                       # 该点之前的占用数
+        after = total - cum                      # 该点之后的占用数
+        votes = free & (before > 0) & (after > 0)
+        pocket_votes += votes.astype(np.int8)    # 正方向已覆盖双向语义
+
+    candidates = pocket_votes >= min_dirs
+    if not candidates.any():
+        candidates = pocket_votes >= 2
+        if not candidates.any():
+            return protein.centroid()
+    # 取最高得分子簇: 以得分最高体素为中心半径 4 A 内加权质心
+    best_flat = np.argmax(pocket_votes * candidates)
+    bi, bj, bk = np.unravel_index(best_flat, pocket_votes.shape)
+    center_voxel = np.array([axis_pts[0][bi], axis_pts[1][bj],
+[第 11 页]
+
+                             axis_pts[2][bk]])
+    # 邻域 4A 内候选点按票数加权
+    lo_i = np.stack(np.meshgrid(
+        *[np.arange(n_cells[i]) for i in range(3)], indexing="ij"), axis=-1)
+    d2 = ((lo_i * spacing + lo - center_voxel) ** 2).sum(axis=-1)
+    near = candidates & (d2 <= 16.0)
+    if not near.any():
+        return center_voxel
+    weights = pocket_votes[near].astype(float)
+    pts_voxel = lo_i[near] * spacing + lo
+    return (pts_voxel * weights[:, None]).sum(axis=0) / weights.sum()
+
+/* ====== 文件: proteindock/io/ligand.py ====== */
+# -*- coding: utf-8 -*-
+"""小分子配体输入输出
+
+ 基于 RDKit 读取 SDF/MOL2/PDB 配体, 自动补 3D 构象(ETKDG),
+ 完成原子分型与可旋转键检测, 输出对接内部表示 Ligand。
+"""
+
+import numpy as np
+
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+from ..chemistry.atom_types import TYPE_INDEX
+from ..chemistry.elements import normalize_element
+
+# RDKit 生成 3D 构象时的随机种子(保证可复现)
+ETKDG_SEED = 2025
+
+
+class Ligand:
+    """配体对象: 重原子坐标 + 打分类型 + 可旋转键。
+
+    :ivar coords: (N,3) 以质心为原点的重原子坐标
+    :ivar elements: (N,) 元素符号
+    :ivar types: (N,) 打分类型
+    :ivar type_ids: (N,) 类型索引
+    :ivar rotatable: list[(i, j, movable_atom_ids)] 可旋转键
+    :ivar torsions: np.ndarray 当前扭转角(rad), 长度与 rotatable 一致
+    """
+
+    def __init__(self, coords, elements, types, rotatable, mol=None, name="ligand"):
+        self.coords = np.asarray(coords, dtype=np.float64)
+        self.elements = list(elements)
+        self.types = list(types)
+        self.type_ids = np.array([TYPE_INDEX[t] for t in types], dtype=np.int64)
+        self.rotatable = rotatable        # [(begin, end, [movable...])]
+        self.torsions = np.zeros(len(rotatable))
+[第 12 页]
+
+        self.name = name
+        self._mol = mol                   # 保留 RDKit 分子用于输出
+
+    @property
+    def n_atoms(self) -> int:
+        return len(self.coords)
+
+    @property
+    def n_torsions(self) -> int:
+        return len(self.rotatable)
+
+    def copy(self) -> "Ligand":
+        lig = Ligand(self.coords.copy(), list(self.elements), list(self.types),
+                     self.rotatable, self._mol, self.name)
+        lig.torsions = self.torsions.copy()
+        return lig
+
+    # ------------------------------------------------------------ 几何
+    def conformer(self, transform=None) -> np.ndarray:
+        """按当前扭转角重建构象, 可再叠加刚体变换。
+
+        :param transform: chemistry.RigidTransform 或 None
+        :return: (N,3) 世界坐标
+        """
+        coords = self.coords.copy()
+        for (b, e, movable), angle in zip(self.rotatable, self.torsions):
+            axis = coords[e] - coords[b]
+            norm = np.linalg.norm(axis)
+            if norm < 1e-6:
+                continue
+            axis = axis / norm
+            c, s = np.cos(angle), np.sin(angle)
+            # Rodrigues 旋转公式
+            kx, ky, kz = axis
+            K = np.array([[0, -kz, ky], [kz, 0, -kx], [-ky, kx, 0]])
+            R = np.eye(3) * c + s * K + (1 - c) * np.outer(axis, axis)
+            coords[movable] = (coords[movable] - coords[e]) @ R.T + coords[e]
+        if transform is not None:
+            coords = transform.apply(coords)
+        return coords
+
+
+def load_ligand(path: str, name: str = None, keep_origin: bool = False) -> Ligand:
+    """读取配体文件(SDF/MOL2/PDB), 必要时生成 3D 构象并分型。
+
+    :param path: 配体文件路径
+    :param keep_origin: True 保留文件原始坐标(数据集 native 用)
+    :return: Ligand 对象
+    """
+    lower = path.lower()
+[第 13 页]
+
+    if lower.endswith((".sdf", ".sd", ".mol")):
+        supplier = Chem.SDMolSupplier(path, removeHs=True, sanitize=True)
+        mol = next((m for m in supplier if m is not None), None)
+    elif lower.endswith(".mol2"):
+        mol = Chem.MolFromMol2File(path, removeHs=True, sanitize=True)
+    elif lower.endswith((".pdb", ".ent")):
+        mol = Chem.MolFromPDBFile(path, removeHs=True, sanitize=True,
+                                  proximityBonding=True)
+    else:
+        raise ValueError("不支持的配体文件格式: {}".format(path))
+    if mol is None:
+        raise ValueError("配体解析失败(请检查分子结构有效性): {}".format(path))
+    return build_ligand(mol, name=name or path, keep_origin=keep_origin)
+
+
+def build_ligand(mol, name: str = "ligand", keep_origin: bool = False) -> Ligand:
+    """从 RDKit Mol 构造 Ligand(自动补 3D、分型、找可旋转键)。
+
+    :param keep_origin: True 保留原始晶格坐标(数据集构建用);
+                        False 平移到质心(对接搜索用, 默认)
+    """
+    mol = Chem.Mol(mol)
+    if any(a.GetSymbol() == "H" for a in mol.GetAtoms()):
+        mol = Chem.RemoveHs(mol)
+    if mol.GetNumConformers() == 0 or mol.GetNumAtoms() < 1:
+        mol = Chem.AddHs(mol)
+        params = AllChem.ETKDGv3()
+        params.randomSeed = ETKDG_SEED
+        AllChem.EmbedMolecule(mol, params)
+        if mol.GetNumConformers() == 0:
+            raise ValueError("无法为配体生成 3D 构象: {}".format(name))
+        mol = Chem.RemoveHs(mol)
+
+    conf = mol.GetConformer()
+    coords = np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
+    elements = [a.GetSymbol().upper() for a in mol.GetAtoms()]
+    types = [_assign_ligand_type(mol, i) for i in range(mol.GetNumAtoms())]
+    rotatable = _find_rotatable_bonds(mol)
+    if not keep_origin:
+        coords = coords - coords.mean(axis=0)
+    lig = Ligand(coords, elements, types, rotatable,
+                 mol=mol, name=name)
+    _refresh_torsions(lig)
+    return lig
+
+
+def _assign_ligand_type(mol, idx: int) -> str:
+    """配体重原子分型(元素 + 杂化 + 邻居启发式)。"""
+    atom = mol.GetAtomWithIdx(idx)
+    el = normalize_element(atom.GetSymbol())
+[第 14 页]
+
+    if el in ("MN", "FE", "ZN", "CU", "MG", "CA", "NA", "K"):
+        return "MET"
+    if el == "C":
+        return "C_A" if atom.GetIsAromatic() else "C_H"
+    if el == "N":
+        if atom.GetIsAromatic():
+            return "NA"
+        has_h = atom.GetTotalNumHs() > 0
+        neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+        amide = "C" in neighbors and any(n in ("O", "S") for n in neighbors)
+        if has_h:
+            return "N_D"
+        return "N" if amide else "NA"
+    if el == "O":
+        return "OA"
+    if el == "S":
+        return "SA"
+    if el == "P":
+        return "P"
+    if el == "F":
+        return "F"
+    if el == "CL":
+        return "CL"
+    if el == "BR":
+        return "BR"
+    if el == "I":
+        return "I"
+    return "C"
+
+
+def _find_rotatable_bonds(mol):
+    """检测非终端可旋转单键(排除酰胺与环内键), 返回可旋转键列表。
+
+    每个元素为 (begin, end, movable_ids): movable_ids 为旋转该键时
+    需要随之运动的原子集合。
+    """
+    pattern = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
+    matches = mol.GetSubstructMatches(pattern)
+    rotatable = []
+    for b, e in matches:
+        bond = mol.GetBondBetweenAtoms(b, e)
+        if bond is None or bond.GetBondType() != Chem.BondType.SINGLE:
+            continue
+        # 排除与氢相连及金属键
+        if mol.GetAtomWithIdx(b).GetSymbol() == "H" or mol.GetAtomWithIdx(e).GetSymbol() == "H":
+            continue
+        movable = _movable_side(mol, b, e)
+        if movable and len(movable) < mol.GetNumAtoms() - 1:
+            rotatable.append((b, e, movable))
+    # 数量封顶(过长链分子保护)
+[第 15 页]
+
+    return rotatable[:16]
+
+
+def _movable_side(mol, b, e):
+    """把键 (b,e) 断开后, e 一侧的原子集合。"""
+    n = mol.GetNumAtoms()
+    adjacency = [[] for _ in range(n)]
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if (i, j) == (b, e) or (j, i) == (b, e):
+            continue
+        adjacency[i].append(j)
+        adjacency[j].append(i)
+    seen = {e}
+    stack = [e]
+    while stack:
+        cur = stack.pop()
+        for nxt in adjacency[cur]:
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    movable = sorted(seen - {e})
+    return [e] + movable if movable else []
+
+
+def _refresh_torsions(lig: Ligand) -> None:
+    """按当前坐标刷新扭转角基准。"""
+    lig.torsions = np.zeros(lig.n_torsions)
+
+
+def write_sdf(lig: Ligand, coords: np.ndarray, path: str, score: float = None,
+              name: str = None) -> None:
+    """把带坐标的配体写为 SDF(可用 VMD/Chimera/3Dmol.js 直接打开)。"""
+    mol = lig._mol
+    conf = mol.GetConformer()
+    for i in range(mol.GetNumAtoms()):
+        x, y, z = coords[i]
+        conf.SetAtomPosition(i, Point3DWrap(x, y, z))
+    writer = Chem.SDWriter(path)
+    if name or score is not None:
+        mol.SetProp("_Name", name or lig.name)
+    if score is not None:
+        mol.SetProp("ProteinDock_Score", "{:.3f}".format(score))
+    writer.write(mol)
+    writer.close()
+
+
+def Point3DWrap(x, y, z):
+    """构造 RDKit Point3D(独立包装便于测试 mock)。"""
+    from rdkit.Geometry import Point3D
+[第 16 页]
+
+    return Point3D(float(x), float(y), float(z))
+
+/* ====== 文件: proteindock/scoring/vina_sf.py ====== */
+# -*- coding: utf-8 -*-
+"""Vina 式多项经验打分函数
+
+ 复现 AutoDock Vina (Trott & Olson, 2010) 五项原子对相互作用:
+   gauss1     宽势阱高斯吸引项
+   gauss2     窄势阱高斯吸引项
+   repulsion  近距立方倒数斥力项
+   hydrophobic 疏水接触阶跃-线性项
+   hbond      氢键阶跃-线性项(方向性不显式建模, 由供/受体类型对承载)
+
+ 实现说明:
+   1. 全部原子对相互作用向量化, 16x16 类型对的系数预先展开成
+      (16,16,5) 张量, 以类型索引直接取用, 无 Python 逐对循环;
+   2. hydrophobic / hbond 基元使用"表面距离" ds = d - ri - rj
+      (原子间距减去双方范德华半径), 与 Vina 的平滑距离一致;
+   3. 组合权重取 Vina 1.1.2 拟合值。
+"""
+
+import numpy as np
+
+from ..chemistry.atom_types import (
+    ATOM_TYPES,
+    TYPE_COEFFICIENTS,
+    TYPE_INDEX,
+    pair_coefficients,
+)
+
+# Vina 1.1.2 全局权重
+W_GAUSS1 = -0.035579
+W_GAUSS2 = -0.005156
+W_REPULSION = 0.840245
+W_HYDROPHOBIC = -0.035069
+W_HBOND = -0.587439
+W_TORSION = 0.054641        # 每个可旋转键的构象熵惩罚
+
+INTERACTION_CUTOFF = 8.0    # 原子对截断 / A
+N_TYPES = len(ATOM_TYPES)
+
+# 每种打分类型的代表 vdW 半径 / A
+TYPE_VDW = {
+    "C_H": 1.70, "C_A": 1.70, "C": 1.70, "N": 1.55, "N_D": 1.55,
+    "NA": 1.55, "O": 1.52, "OA": 1.52, "S": 1.80, "SA": 1.80,
+    "P": 1.80, "F": 1.47, "CL": 1.75, "BR": 1.85, "I": 1.98, "MET": 2.05,
+}
+
+# 全局权重向量 (与系数 5 元组同序)
+_WEIGHTS = np.array([W_GAUSS1, W_GAUSS2, W_REPULSION, W_HYDROPHOBIC, W_HBOND])
+[第 17 页]
+
+
+
+def _build_coefficient_tensor():
+    """展开 (16,16,5) 原子对系数张量(模块级缓存)。"""
+    tensor = np.zeros((N_TYPES, N_TYPES, 5))
+    for i, a in enumerate(ATOM_TYPES):
+        for j, b in enumerate(ATOM_TYPES):
+            tensor[i, j] = pair_coefficients(a, b)
+    return tensor
+
+
+_COEFF_TENSOR = _build_coefficient_tensor()
+_VDW_VECTOR = np.array([TYPE_VDW[t] for t in ATOM_TYPES])
+
+
+def _linear_step(values, x_low, x_high):
+    """[x_low, x_high] 内 1->0 线性衰减的阶跃基元。"""
+    out = np.zeros_like(values)
+    if x_high > x_low:
+        out[values < x_low] = 1.0
+        band = (values >= x_low) & (values <= x_high)
+        out[band] = (x_high - values[band]) / (x_high - x_low)
+    else:
+        out[values < x_high] = 1.0
+    return out
+
+
+def pairwise_term_sum(lig_type_ids, rec_type_ids, d_matrix, cutoff=None):
+    """计算两组原子间五项能量之和(全向量化)。
+
+    :param lig_type_ids: (N,) 配体类型索引
+    :param rec_type_ids: (M,) 蛋白类型索引
+    :param d_matrix: (N,M) 原子间距离矩阵 / A
+    :param cutoff: 距离截断, 默认 8 A
+    :return: (5,) 各项加权和向量 [gauss1, gauss2, repulsion, hydrophobic, hbond]
+    """
+    cutoff = INTERACTION_CUTOFF if cutoff is None else cutoff
+    lig_ids = np.asarray(lig_type_ids)
+    rec_ids = np.asarray(rec_type_ids)
+    d = np.asarray(d_matrix, dtype=np.float64)
+
+    close = d < cutoff
+    if not close.any():
+        return np.zeros(5)
+
+    rows, cols = np.nonzero(close)
+    dist = d[rows, cols]
+    coeff = _COEFF_TENSOR[lig_ids[rows], rec_ids[cols]]        # (K,5)
+    r_pair = _VDW_VECTOR[lig_ids[rows]] + _VDW_VECTOR[rec_ids[cols]]
+    # 表面距离(Vina 平滑距离): ds = d - ri - rj
+[第 18 页]
+
+    ds = dist - r_pair
+
+    g1 = np.exp(-(dist / 0.5) ** 2)
+    g2 = np.exp(-((dist - 3.0) / 2.0) ** 2)
+    # 斥力基元: 仅当原子间距小于 0.9 倍 vdW 半径和(即实际穿透)时惩罚
+    rep_cut = 0.9 * r_pair
+    rep = np.where(dist < rep_cut,
+                   (rep_cut / np.maximum(dist, 1e-6) - 1.0) ** 2, 0.0)
+    hydro = _linear_step(ds, 0.5, 2.0)
+    hb = _linear_step(ds, -0.7, 0.0)
+
+    primitives = np.stack([g1, g2, rep, hydro, hb], axis=1)     # (K,5)
+    weighted = ((coeff * primitives) * _WEIGHTS).sum(axis=0)    # (5,)
+    return weighted
+
+
+def intermolecular_energy(lig_types_ids, rec_types_ids, d_matrix):
+    """蛋白-配体相互作用总能量及分解。
+
+    :return: (total_kcal, terms_dict)
+    """
+    weighted = pairwise_term_sum(lig_types_ids, rec_types_ids, d_matrix)
+    terms = {
+        "gauss1": float(weighted[0]),
+        "gauss2": float(weighted[1]),
+        "repulsion": float(weighted[2]),
+        "hydrophobic": float(weighted[3]),
+        "hbond": float(weighted[4]),
+    }
+    return float(weighted.sum()), terms
+
+
+def intramolecular_energy(lig_type_ids, coords, n_torsions=0):
+    """配体内部非键相互作用(仅斥力项) + 构象熵惩罚。
+
+    近似处理:
+      1. 排除 d < 1.9 A 的成键/1-3 对, 避免把共价几何记为斥力;
+      2. 只保留斥力项用于防止自碰撞 —— 不计入分子内吸引项,
+         否则构象搜索会退化为「远离蛋白的自折叠构象」。
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    n = len(coords)
+    energy = 0.0
+    if n >= 2:
+        d = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(axis=2))
+        iu = np.triu_indices(n, k=1)
+        dd = d[iu]
+        valid = (dd >= 1.9) & (dd < INTERACTION_CUTOFF)
+        if valid.any():
+            pairs = np.stack([iu[0][valid], iu[1][valid]], axis=1)
+[第 19 页]
+
+            sub = pairwise_term_sum(
+                np.asarray(lig_type_ids)[pairs[:, 0]],
+                np.asarray(lig_type_ids)[pairs[:, 1]],
+                d[pairs[:, 0], pairs[:, 1]][:, None],
+            )
+            energy = float(sub[2])        # 仅斥力分量
+    return energy + torsion_penalty(n_torsions)
+
+
+def torsion_penalty(n_torsions: int) -> float:
+    """可旋转键构象熵惩罚。"""
+    return W_TORSION * float(n_torsions)
+
+/* ====== 文件: proteindock/scoring/grid.py ====== */
+# -*- coding: utf-8 -*-
+"""打分网格(Scoring Grid)预计算加速
+
+ 把蛋白对每种配体原子类型的相互作用能预涂到以口袋为中心的
+ 0.375 A 间距三维网格上; 构象搜索阶段对配体原子做三线性插值
+ 即可 O(1) 取得相互作用能, 避免每次评估全量原子对距离矩阵。
+"""
+
+import numpy as np
+
+from ..chemistry.atom_types import ATOM_TYPES, TYPE_INDEX
+from .vina_sf import (
+    INTERACTION_CUTOFF,
+    W_GAUSS1,
+    W_GAUSS2,
+    W_HBOND,
+    W_HYDROPHOBIC,
+    W_REPULSION,
+    _COEFF_TENSOR,
+    _VDW_VECTOR,
+)
+
+GRID_SPACING = 0.375          # 网格间距 / A (与 AutoDock 一致)
+DEFAULT_BOX_SIZE = 24.0       # 盒子边长 / A
+BOUNDARY_PENALTY = 50.0       # 原子越界惩罚(每原子)
+
+
+class ScoreGrid:
+    """口袋打分网格: 16 个类型通道的能量场。"""
+
+    def __init__(self, center, size=DEFAULT_BOX_SIZE, spacing=GRID_SPACING):
+        self.center = np.asarray(center, dtype=np.float64)
+        self.size = float(size)
+        self.spacing = float(spacing)
+        self.n_cells = int(np.floor(self.size / self.spacing))
+        half = (self.n_cells - 1) * self.spacing / 2.0
+[第 20 页]
+
+        self.origin = self.center - half          # 格点 0 的坐标
+        # (n_cells, n_cells, n_cells, n_types) 能量场
+        self.fields = np.zeros((self.n_cells, self.n_cells, self.n_cells,
+                                len(ATOM_TYPES)), dtype=np.float32)
+        self._built = False
+
+    # ------------------------------------------------------------ 构建
+    def build(self, rec_coords, rec_type_ids, verbose=False):
+        """把蛋白原子相互作用贡献涂到网格上。
+
+        对每个蛋白原子, 在其截断球覆盖的格点上叠加
+        五项基元 x 类型对系数 x 全局权重 的能量值。
+        """
+        rec_coords = np.asarray(rec_coords, dtype=np.float64)
+        rec_type_ids = np.asarray(rec_type_ids)
+        n_types = len(ATOM_TYPES)
+
+        # 轴向格点坐标(各轴独立: origin 为盒子角落坐标)
+        axes = [self.origin[i] + np.arange(self.n_cells) * self.spacing
+                for i in range(3)]
+        cut_cells = int(np.ceil(INTERACTION_CUTOFF / self.spacing))
+        cutoff2 = INTERACTION_CUTOFF ** 2
+
+        for ai in range(len(rec_coords)):
+            pos = rec_coords[ai]
+            # 快速丢弃: 原子到盒子最 近/远 距离
+            if np.abs(pos - self.center).max() > self.size / 2 + INTERACTION_CUTOFF:
+                continue
+            ri = _VDW_VECTOR[rec_type_ids[ai]]
+            i0, j0, k0 = np.floor((pos - self.origin) / self.spacing).astype(int)
+            lo = max(i0 - cut_cells, 0); hi = min(i0 + cut_cells + 1, self.n_cells)
+            lo_j = max(j0 - cut_cells, 0); hi_j = min(j0 + cut_cells + 1, self.n_cells)
+            lo_k = max(k0 - cut_cells, 0); hi_k = min(k0 + cut_cells + 1, self.n_cells)
+            if lo >= hi or lo_j >= hi_j or lo_k >= hi_k:
+                continue
+
+            gx = axes[0][lo:hi] - pos[0]
+            gy = axes[1][lo_j:hi_j] - pos[1]
+            gz = axes[2][lo_k:hi_k] - pos[2]
+            dx, dy, dz = np.meshgrid(gx, gy, gz, indexing="ij")
+            d2 = dx * dx + dy * dy + dz * dz
+            mask = d2 < cutoff2
+            if not mask.any():
+                continue
+            d = np.sqrt(d2)
+
+            # 基元值 (M1,M2,M3)
+            g1 = np.exp(-(d / 0.5) ** 2)
+            g2 = np.exp(-((d - 3.0) / 2.0) ** 2)
+            # 斥力: 距离小于 0.9 倍 vdW 半径和(穿透)时惩罚
+[第 21 页]
+
+            r_pair = ri + _VDW_VECTOR                      # (n_types,)
+            rep_cut = 0.9 * r_pair
+            dexp = d[..., None]                            # (M..., 1)
+            rep = np.where(dexp < rep_cut,
+                           (rep_cut / np.maximum(dexp, 1e-6) - 1.0) ** 2,
+                           0.0)
+            ds = dexp - r_pair                             # 表面距离 (M..., n_types)
+            hydro = _linear_step_batch(ds, 0.5, 2.0)      # (M..., n_types)
+            hb = _linear_step_batch(ds, -0.7, 0.0)
+
+            coeff = _COEFF_TENSOR[:, rec_type_ids[ai]]    # (n_types, 5)
+            # 每类型能量: sum_k w_k * c_k * prim_k
+            e = (coeff[:, 0] * W_GAUSS1) * g1[..., None] \
+                + (coeff[:, 1] * W_GAUSS2) * g2[..., None] \
+                + (coeff[:, 2] * W_REPULSION) * rep \
+                + (coeff[:, 3] * W_HYDROPHOBIC) * hydro \
+                + (coeff[:, 4] * W_HBOND) * hb
+            block = np.where(mask[..., None], e, 0.0)
+            self.fields[lo:hi, lo_j:hi_j, lo_k:hi_k] += block.astype(np.float32)
+            if verbose and ai % 500 == 0:
+                print("  grid building {}/{}".format(ai, len(rec_coords)))
+
+        self._built = True
+        return self
+
+    # ------------------------------------------------------------ 查询
+    def score(self, coords, type_ids) -> float:
+        """对一组配体原子做三线性插值求相互作用能总和。"""
+        if not self._built:
+            raise RuntimeError("网格尚未 build()")
+        coords = np.asarray(coords, dtype=np.float64)
+        u = (coords - self.origin) / self.spacing
+        in_bounds = ((u >= 0) & (u <= self.n_cells - 1)).all(axis=1)
+        if not in_bounds.all():
+            # 越界原子: 盒内部分正常打分, 盒外按惩罚计
+            total = BOUNDARY_PENALTY * float((~in_bounds).sum())
+            if not in_bounds.any():
+                return total
+        else:
+            total = 0.0
+        u = u[in_bounds]
+        ids = np.asarray(type_ids)[in_bounds]
+
+        i0 = np.floor(u).astype(int)
+        frac = u - i0
+        i1 = np.minimum(i0 + 1, self.n_cells - 1)
+        fx, fy, fz = frac[:, 0], frac[:, 1], frac[:, 2]
+        total_field = 0.0
+        for atom_i in range(len(u)):
+            a, b, c = i0[atom_i]
+[第 22 页]
+
+            d, e, f = i1[atom_i]
+            corner = self.fields
+            v000 = corner[a, b, c, ids[atom_i]]; v100 = corner[d, b, c, ids[atom_i]]
+            v010 = corner[a, e, c, ids[atom_i]]; v110 = corner[d, e, c, ids[atom_i]]
+            v001 = corner[a, b, f, ids[atom_i]]; v101 = corner[d, b, f, ids[atom_i]]
+            v011 = corner[a, e, f, ids[atom_i]]; v111 = corner[d, e, f, ids[atom_i]]
+            wx, wy, wz = fx[atom_i], fy[atom_i], fz[atom_i]
+            val = (v000 * (1 - wx) * (1 - wy) * (1 - wz)
+                   + v100 * wx * (1 - wy) * (1 - wz)
+                   + v010 * (1 - wx) * wy * (1 - wz)
+                   + v110 * wx * wy * (1 - wz)
+                   + v001 * (1 - wx) * (1 - wy) * wz
+                   + v101 * wx * (1 - wy) * wz
+                   + v011 * (1 - wx) * wy * wz
+                   + v111 * wx * wy * wz)
+            total_field += float(val)
+        return total + total_field
+
+    def box_extent(self):
+        """返回盒子两角坐标, 供可视化。"""
+        half = self.size / 2.0
+        return self.center - half, self.center + half
+
+
+def _linear_step_batch(values, x_low, x_high):
+    """_linear_step 的批量版, values 形状 (..., K) 对 K 种类型。"""
+    out = np.zeros_like(values)
+    if x_high > x_low:
+        out[values < x_low] = 1.0
+        band = (values >= x_low) & (values <= x_high)
+        out[band] = (x_high - values[band]) / (x_high - x_low)
+    else:
+        out[values < x_high] = 1.0
+    return out
+
+/* ====== 文件: proteindock/scoring/hybrid.py ====== */
+# -*- coding: utf-8 -*-
+"""混合打分器: 物理经验打分 + 深度学习 GNN 打分
+
+ 对接搜索阶段使用网格加速的 Vina 式经验打分快速评估;
+ 对搜索产生的候选 pose, 再用 E(n) 等变图神经网络(EGNN)重打分,
+ 两者加权融合作为最终排序依据 —— 即「物理先验 + 数据驱动」的
+ 混合(hybrid)策略。
+"""
+
+import numpy as np
+
+from .grid import ScoreGrid
+from .vina_sf import intramolecular_energy
+
+[第 23 页]
+
+
+class HybridScorer:
+    """经验 + 深度学习双通道打分器。
+
+    :param grid: 已构建的 ScoreGrid
+    :param dl_model: 已加载权重的 EGNN 打分模型(可为 None, 退化为纯经验)
+    :param dl_weight: DL 分数融合权重 (final = vina + dl_weight * dl)
+    :param device: torch 设备
+    """
+
+    def __init__(self, grid: ScoreGrid, dl_model=None, protein=None,
+                 center=None, dl_weight=1.0, device="cpu"):
+        self.grid = grid
+        self.dl_model = dl_model
+        self.protein = protein          # DL 通道需要蛋白对象构图
+        self.center = None if center is None else np.asarray(center, float)
+        self.dl_weight = float(dl_weight)
+        self.device = device
+
+    def vina_score(self, ligand, coords) -> dict:
+        """经验打分通道: 网格相互作用 + 内部能 + 扭转熵惩罚。"""
+        inter = self.grid.score(coords, ligand.type_ids)
+        intra = intramolecular_energy(ligand.type_ids, coords,
+                                      ligand.n_torsions)
+        return {
+            "inter": float(inter),
+            "intra": float(intra),
+            "total": float(inter + intra),
+        }
+
+    def dl_score(self, ligand, coords) -> float:
+        """深度学习通道: EGNN 对整个 pose 输出结合能(kcal/mol)。"""
+        if self.dl_model is None or self.protein is None or self.center is None:
+            return 0.0
+        from ..dl.features import pose_to_graph   # 延迟导入避免循环依赖
+        graph = pose_to_graph(ligand, coords, self.protein, self.center)
+        if graph is None:
+            return 0.0
+        import torch
+        self.dl_model.eval()
+        with torch.no_grad():
+            graph = {k: (v.to(self.device) if torch.is_tensor(v) else v)
+                     for k, v in graph.items()}
+            pred = self.dl_model(graph).view(-1)
+            return float(pred[0].item())
+
+    def score(self, ligand, coords) -> dict:
+        """综合打分入口。
+
+        :return: dict(vina_inter, vina_intra, vina, dl, final, terms...)
+[第 24 页]
+
+        """
+        vina = self.vina_score(ligand, coords)
+        result = {
+            "vina_inter": vina["inter"],
+            "vina_intra": vina["intra"],
+            "vina": vina["total"],
+        }
+        if self.dl_model is not None:
+            dl = self.dl_score(ligand, coords)
+            result["dl"] = dl
+            result["final"] = result["vina"] + self.dl_weight * dl
+        else:
+            result["dl"] = None
+            result["final"] = result["vina"]
+        return result
+
+/* ====== 文件: proteindock/search/mc_sa.py ====== */
+# -*- coding: utf-8 -*-
+"""蒙特卡洛模拟退火(MC-SA)构象搜索
+
+ 配体 pose 由「平移 + 单位四元数 + 可旋转键扭转角」参数化。
+ 搜索流程借鉴 AutoDock Vina 的 iterated local search 思想:
+   随机初始化 -> 高温随机扰动(Metropolis 接受) -> 温度几何降温
+   -> 低温局部细化, 并周期性回火(reheat)跳出局部极小。
+"""
+
+import numpy as np
+
+from ..chemistry.geometry import (
+    RigidTransform,
+    quaternion_normalize,
+    random_quaternion,
+    small_random_quaternion,
+)
+
+MAX_TRANSLATE = 2.0     # 单步最大平移 / A
+MAX_ROTATE = np.radians(25.0)   # 单步最大旋转
+MAX_TORSION = np.radians(30.0)  # 单步最大扭转变化
+
+
+class Pose:
+    """对接构象参数化表示。"""
+
+    __slots__ = ("translation", "rotation_q", "torsions")
+
+    def __init__(self, translation, rotation_q, torsions):
+        self.translation = np.asarray(translation, dtype=np.float64)
+        self.rotation_q = quaternion_normalize(np.asarray(rotation_q, float))
+        self.torsions = np.asarray(torsions, dtype=np.float64)
+
+[第 25 页]
+
+    # ------------------------------------------------------------ 采样
+    @classmethod
+    def random(cls, ligand, center, box_size, rng):
+        """在口袋中心附近随机初始化 pose(高斯采样, 提高落入率)。"""
+        sigma = box_size / 6.0
+        half = box_size / 2.0 - 1.0
+        t = np.asarray(center) + np.clip(
+            rng.normal(0, sigma, size=3), -half, half)
+        q = random_quaternion(rng)
+        tor = rng.uniform(-np.pi, np.pi, size=ligand.n_torsions)
+        return cls(t, q, tor)
+
+    def perturb(self, ligand, rng, temperature=1.0):
+        """温度自适应随机扰动, 返回新 Pose。"""
+        scale = max(temperature, 0.05)
+        dt = rng.uniform(-1, 1, size=3) * MAX_TRANSLATE * scale
+        dq = small_random_quaternion(rng, MAX_ROTATE * scale)
+        from ..chemistry.geometry import quaternion_multiply
+        new = Pose(
+            self.translation + dt,
+            quaternion_multiply(dq, self.rotation_q),
+            self.torsions.copy(),
+        )
+        if ligand.n_torsions:
+            idx = rng.integers(0, ligand.n_torsions)
+            new.torsions[idx] += rng.uniform(-1, 1) * MAX_TORSION * scale
+        return new
+
+    # ------------------------------------------------------------ 坐标
+    def coords(self, ligand) -> np.ndarray:
+        """重建该 pose 的配体世界坐标。"""
+        tr = RigidTransform(self.translation, self.rotation_q)
+        return ligand.conformer(tr)
+
+    def copy(self) -> "Pose":
+        return Pose(self.translation.copy(), self.rotation_q.copy(),
+                    self.torsions.copy())
+
+
+def _metropolis(e_old, e_new, temperature, rng):
+    """Metropolis 接受准则(能量越低越优)。"""
+    if e_new <= e_old:
+        return True
+    return rng.random() < np.exp(-(e_new - e_old) / max(temperature, 1e-6))
+
+
+def simulated_annealing(ligand, scorer, center, box_size, rng,
+                        n_cycles=8, steps_per_cycle=260,
+                        t_init=2.5, t_final=0.02, callback=None):
+    """执行一次完整的 MC-SA 搜索。
+[第 26 页]
+
+
+    :param ligand: io.ligand.Ligand
+    :param scorer: scoring.hybrid.HybridScorer (使用其 vina 快速通道)
+    :param center: 口袋中心
+    :param box_size: 搜索盒子边长 / A
+    :param rng: numpy 随机生成器
+    :return: dict(pose, score, trajectory)
+    """
+    pose = Pose.random(ligand, center, box_size, rng)
+    energy = scorer.vina_score(ligand, pose.coords(ligand))["total"]
+    best_pose, best_energy = pose.copy(), energy
+    trajectory = [energy]
+
+    total_steps = n_cycles * steps_per_cycle
+    for step in range(total_steps):
+        frac = step / max(total_steps - 1, 1)
+        # 几何降温 + 周期性回火
+        cycle_frac = (step % steps_per_cycle) / steps_per_cycle
+        reheat = 1.0 + 0.6 * np.cos(2 * np.pi * (step // steps_per_cycle))
+        temperature = (t_init * (t_final / t_init) ** frac) * reheat \
+            if cycle_frac > 0 else t_init
+
+        cand = pose.perturb(ligand, rng, temperature)
+        cand_energy = scorer.vina_score(ligand, cand.coords(ligand))["total"]
+        if _metropolis(energy, cand_energy, temperature, rng):
+            pose, energy = cand, cand_energy
+            if energy < best_energy:
+                best_energy = energy
+                best_pose = pose.copy()
+        trajectory.append(energy)
+        if callback is not None:
+            callback(step, total_steps, energy, best_energy)
+
+    return {"pose": best_pose, "score": best_energy, "trajectory": trajectory}
+
+/* ====== 文件: proteindock/search/genetic.py ====== */
+# -*- coding: utf-8 -*-
+"""遗传算法(GA)构象搜索
+
+ 把配体 pose 编码为「浮点基因」: [平移(3), 四元数(4), 扭转角(T)]。
+ 采用锦标赛选择 + 精英保留 + 混合交叉(刚体参数凸组合 / 扭转均匀交叉)
+ + 自适应高斯变异。与 MC-SA 串联构成混合搜索策略:
+ GA 负责全局探索, MC-SA 负责局部细化。
+"""
+
+import numpy as np
+
+from ..chemistry.geometry import quaternion_normalize
+from .mc_sa import Pose
+
+[第 27 页]
+
+TOURNAMENT_K = 3        # 锦标赛规模
+MUTATE_SIGMA = 0.25     # 变异强度基准
+
+
+def pose_to_genes(pose: Pose) -> np.ndarray:
+    """Pose -> 浮点基因向量 (7+T,)。"""
+    return np.concatenate([pose.translation, pose.rotation_q, pose.torsions])
+
+
+def genes_to_pose(genes: np.ndarray) -> Pose:
+    """浮点基因向量 -> Pose。"""
+    genes = np.asarray(genes, dtype=np.float64)
+    return Pose(genes[:3], genes[3:7], genes[7:])
+
+
+class GeneticSearch:
+    """配体构象搜索的遗传算法实现。"""
+
+    def __init__(self, ligand, scorer, center, box_size, rng,
+                 pop_size=48, n_generations=36, elite=4):
+        self.ligand = ligand
+        self.scorer = scorer
+        self.center = np.asarray(center, dtype=np.float64)
+        self.box_size = float(box_size)
+        self.rng = rng
+        self.pop_size = pop_size
+        self.n_generations = n_generations
+        self.elite = elite
+        self.history = []
+
+    # ------------------------------------------------------------ 适应度
+    def _fitness(self, pose: Pose) -> float:
+        """能量越小适应度问题转化为返回能量(最小化)。"""
+        return self.scorer.vina_score(self.ligand, pose.coords(self.ligand))["total"]
+
+    # ------------------------------------------------------------ 算子
+    def _init_population(self):
+        pop = [Pose.random(self.ligand, self.center, self.box_size, self.rng)
+               for _ in range(self.pop_size)]
+        return pop
+
+    def _tournament(self, energies):
+        """锦标赛选择一个个体下标。"""
+        candidates = self.rng.integers(0, self.pop_size, size=TOURNAMENT_K)
+        return int(candidates[np.argmin(energies[candidates])])
+
+    def _crossover(self, pa: Pose, pb: Pose) -> Pose:
+        """混合交叉: 刚体凸组合 + 扭转均匀交叉。"""
+        alpha = self.rng.uniform(0.2, 0.8)
+        translation = alpha * pa.translation + (1 - alpha) * pb.translation
+[第 28 页]
+
+        rotation = quaternion_normalize(alpha * pa.rotation_q
+                                        + (1 - alpha) * pb.rotation_q)
+        if self.ligand.n_torsions:
+            mask = self.rng.random(self.ligand.n_torsions) < 0.5
+            torsions = np.where(mask, pa.torsions, pb.torsions)
+        else:
+            torsions = np.zeros(0)
+        return Pose(translation, rotation, torsions)
+
+    def _mutate(self, pose: Pose, sigma=MUTATE_SIGMA) -> Pose:
+        """自适应高斯变异: 平移 / 旋转 / 扭转各自独立概率扰动。"""
+        translation = pose.translation.copy()
+        rotation = pose.rotation_q.copy()
+        torsions = pose.torsions.copy()
+        if self.rng.random() < 0.55:
+            translation += self.rng.normal(0, sigma * 2.0, size=3)
+        if self.rng.random() < 0.55:
+            axis = self.rng.normal(size=3)
+            axis /= max(np.linalg.norm(axis), 1e-12)
+            ang = self.rng.normal(0, sigma * 1.5)
+            half = ang / 2.0
+            dq = np.array([np.cos(half), *(np.sin(half) * axis)])
+            from ..chemistry.geometry import quaternion_multiply
+            rotation = quaternion_multiply(dq, rotation)
+        if len(torsions) and self.rng.random() < 0.7:
+            k = max(1, int(len(torsions) * 0.35))
+            idx = self.rng.choice(len(torsions), size=k, replace=False)
+            torsions[idx] += self.rng.normal(0, sigma * 2.5, size=k)
+        return Pose(translation, quaternion_normalize(rotation), torsions)
+
+    # ------------------------------------------------------------ 主循环
+    def run(self, callback=None):
+        """执行进化搜索, 返回最优 pose 与能量。"""
+        population = self._init_population()
+        energies = np.array([self._fitness(p) for p in population])
+        best_i = int(np.argmin(energies))
+        best_pose, best_energy = population[best_i].copy(), float(energies[best_i])
+
+        for gen in range(self.n_generations):
+            sigma = MUTATE_SIGMA * (1.0 - 0.7 * gen / max(self.n_generations - 1, 1))
+            new_pop = []
+            # 精英保留
+            order = np.argsort(energies)
+            for rank in order[:self.elite]:
+                new_pop.append(population[rank].copy())
+            while len(new_pop) < self.pop_size:
+                pa = population[self._tournament(energies)]
+                pb = population[self._tournament(energies)]
+                child = self._crossover(pa, pb)
+                if self.rng.random() < 0.85:
+[第 29 页]
+
+                    child = self._mutate(child, sigma)
+                new_pop.append(child)
+            population = new_pop
+            energies = np.array([self._fitness(p) for p in population])
+            gen_best = int(np.argmin(energies))
+            if energies[gen_best] < best_energy:
+                best_energy = float(energies[gen_best])
+                best_pose = population[gen_best].copy()
+            self.history.append(float(energies.min()))
+            if callback is not None:
+                callback(gen, self.n_generations, float(energies.min()),
+                         best_energy)
+
+        return {"pose": best_pose, "score": best_energy, "history": self.history}
+
+/* ====== 文件: proteindock/dl/features.py ====== */
+# -*- coding: utf-8 -*-
+"""Pose -> 图数据特征构造
+
+ 把「配体 pose + 蛋白口袋原子」编码为异质图:
+   节点 = 配体重原子 ∪ 口袋重原子
+   节点特征 = 原子类型 one-hot(16) + 是否配体标志
+   边 = 距离截断内的原子对(含配体-蛋白跨边)
+   边特征 = 高斯距离展开(16 通道)
+
+ 输出为轻量自描述 dict(tensor), 不依赖 torch_geometric。
+"""
+
+import numpy as np
+import torch
+
+from ..chemistry.atom_types import ATOM_TYPES
+
+N_FEATURE_TYPES = len(ATOM_TYPES)
+EDGE_GAUSS_CENTERS = np.linspace(0.5, 9.5, 16)     # 高斯展开中心 / A
+EDGE_GAUSS_WIDTH = 0.6
+POSE_EDGE_CUTOFF = 10.0
+MAX_POCKET_ATOMS = 260                              # 口袋原子采样上限
+
+
+def gaussian_edge_features(dist: np.ndarray) -> np.ndarray:
+    """距离 -> (K, 16) 高斯展开特征。"""
+    d = np.atleast_1d(np.asarray(dist, dtype=np.float64))
+    feats = np.exp(-((d[:, None] - EDGE_GAUSS_CENTERS[None, :])
+                     / EDGE_GAUSS_WIDTH) ** 2)
+    return feats.astype(np.float32)
+
+
+def pocket_atoms(protein, center, radius=10.0, max_atoms=MAX_POCKET_ATOMS):
+    """提取口袋范围内的蛋白原子(坐标/类型), 超出上限时随机采样。"""
+[第 30 页]
+
+    mask = protein.pocket_atoms_mask(center, radius)
+    idx = np.nonzero(mask)[0]
+    if len(idx) > max_atoms:
+        rng = np.random.default_rng(7)
+        idx = rng.choice(idx, size=max_atoms, replace=False)
+        idx.sort()
+    return protein.coords[idx], protein.type_ids[idx], idx
+
+
+def pose_to_graph(ligand, lig_coords, protein, center, device="cpu"):
+    """构造 EGNN 输入图。
+
+......(中间部分略)......
+
+                    merged = True
+                    break
+            if not merged:
+                reps.append([pose, 1])
+        return [(p, size) for p, size in reps]
+
+    @staticmethod
+    def _pose_rmsd(pose_a: Pose, pose_b: Pose, ligand: Ligand = None,
+                   n_sample=40) -> float:
+        """两个 pose 的近似 RMSD(按平移距离 + 半径衰减估计, 避免频繁重建构象)。"""
+        d_t = float(np.linalg.norm(pose_a.translation - pose_b.translation))
+        # 旋转差异: 四元数内积
+        dot = abs(float(np.dot(pose_a.rotation_q, pose_b.rotation_q)))
+        ang = 2.0 * np.arccos(min(1.0, dot))
+        # 经验映射: 平移 + 旋转角(rad)*1.5A 近似 RMSD
+        return d_t + 1.5 * ang
+
+    # ------------------------------------------------------------ 输出
+    def save(self, save_dir):
+        """输出 top 构象 SDF 与 report.json / report 文本。"""
+        os.makedirs(save_dir, exist_ok=True)
+        for res in self.results:
+            out_sdf = os.path.join(save_dir,
+                                   "pose_{}.sdf".format(res.rank))
+            write_sdf(self.ligand, res.coords, out_sdf,
+                      score=res.scores.get("final"), 
+                      name="{}_rank{}".format(self.ligand.name, res.rank))
+        # 蛋白-配体复合物 PDB(取最优构象)
+        if self.results:
+            best = self.results[0]
+            complex_path = os.path.join(save_dir, "complex_best.pdb")
+            with open(complex_path, "w", encoding="utf-8") as fh:
+                for i in range(self.protein.n_atoms):
+                    x, y, z = self.protein.coords[i]
+                    fh.write(
+                        "ATOM  {:5d} {:>4s} {:3s} {:1s}{:4d}    "
+[第 31 页]
+
+                        "{:8.3f}{:8.3f}{:8.3f}  1.00  0.00          {:>2s}\n"
+                        .format(i + 1, self.protein.atom_names[i],
+                                self.protein.res_names[i],
+                                self.protein.chains[i],
+                                int(self.protein.res_ids[i]), x, y, z,
+                                self.protein.elements[i]))
+                for j, (xyz, el) in enumerate(zip(best.coords,
+                                                  self.ligand.elements)):
+                    fh.write("HETATM{:5d} {:>4s} LIG A 999    "
+                             "{:8.3f}{:8.3f}{:8.3f}  1.00  0.00          {:>2s}\n"
+                             .format(9000 + j, el + str(j + 1),
+                                     xyz[0], xyz[1], xyz[2], el))
+                fh.write("END\n")
+        report = {
+            "software": "ProteinDock v1.0",
+            "stats": self.stats,
+            "results": [r.to_dict() for r in self.results],
+        }
+        with open(os.path.join(save_dir, "report.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(report, fh, ensure_ascii=False, indent=2)
+        return save_dir
+
+/* ====== 文件: proteindock/cli.py ====== */
+# -*- coding: utf-8 -*-
+"""ProteinDock 命令行接口
+
+ 子命令:
+   dock    执行蛋白-小分子对接
+   train   训练 EGNN 深度学习打分模型
+   web     启动 Web 可视化平台
+   info    打印环境与版本信息
+"""
+
+import argparse
+import os
+import sys
+
+from . import __version__
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="proteindock",
+        description="ProteinDock 基于深度学习打分的蛋白质-小分子对接平台 v{}".format(
+            __version__))
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ---------------- dock ----------------
+    p_dock = sub.add_parser("dock", help="执行蛋白-小分子对接")
+[第 32 页]
+
+    p_dock.add_argument("-r", "--receptor", required=True,
+                        help="蛋白质 PDB 文件")
+    p_dock.add_argument("-l", "--ligand", required=True,
+                        help="配体 SDF/MOL2/PDB 文件")
+    p_dock.add_argument("-o", "--out", default="proteindock_out",
+                        help="输出目录(默认 proteindock_out)")
+    p_dock.add_argument("--pocket", nargs=3, type=float, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="口袋中心坐标(默认自动检测)")
+    p_dock.add_argument("--box", type=float, default=24.0,
+                        help="搜索盒子边长 / A(默认 24)")
+    p_dock.add_argument("--exhaustiveness", type=int, default=8,
+                        help="独立搜索次数(默认 8)")
+    p_dock.add_argument("--method", choices=["mc_sa", "ga", "hybrid"],
+                        default="hybrid", help="搜索策略(默认 hybrid)")
+    p_dock.add_argument("--model", default=None,
+                        help="EGNN 打分模型权重路径(可选)")
+    p_dock.add_argument("--dl-weight", type=float, default=1.0,
+                        help="深度学习分数融合权重(默认 1.0)")
+    p_dock.add_argument("--top-k", type=int, default=9,
+                        help="保留前 K 个构象(默认 9)")
+    p_dock.add_argument("--seed", type=int, default=2025, help="随机种子")
+
+    # ---------------- train ----------------
+    p_train = sub.add_parser("train", help="训练 EGNN 打分模型")
+    p_train.add_argument("--data", required=True,
+                         help="dockdata 数据集根目录")
+    p_train.add_argument("--out", default="models/egnn", help="模型输出目录")
+    p_train.add_argument("--epochs", type=int, default=30)
+    p_train.add_argument("--batch-size", type=int, default=8)
+    p_train.add_argument("--lr", type=float, default=1e-3)
+    p_train.add_argument("--hidden", type=int, default=96)
+    p_train.add_argument("--layers", type=int, default=4)
+    p_train.add_argument("--device", default=None,
+                         help="cpu / cuda(默认自动)")
+
+    # ---------------- web ----------------
+    p_web = sub.add_parser("web", help="启动 Web 可视化平台")
+    p_web.add_argument("--host", default="0.0.0.0")
+    p_web.add_argument("--port", type=int, default=8000)
+    p_web.add_argument("--model", default=None, help="EGNN 权重路径")
+    p_web.add_argument("--workdir", default="web_jobs",
+                       help="任务与上传文件目录")
+
+    # ---------------- info ----------------
+    sub.add_parser("info", help="打印环境与版本信息")
+    return parser
+
+
+def cmd_dock(args) -> int:
+[第 33 页]
+
+    import numpy as np
+    from .io.protein import parse_pdb
+    from .io.ligand import load_ligand
+    from .pipeline import DockingPipeline
+
+    print("== ProteinDock v{} ==".format(__version__))
+    print("受体: {}".format(args.receptor))
+    print("配体: {}".format(args.ligand))
+    protein = parse_pdb(args.receptor)
+    ligand = load_ligand(args.ligand)
+    print("蛋白重原子 {} 个 | 配体重原子 {} 个 | 可旋转键 {} 个".format(
+        protein.n_atoms, ligand.n_atoms, ligand.n_torsions))
+
+    pocket = np.array(args.pocket) if args.pocket else None
+    pipeline = DockingPipeline(
+        protein, ligand, pocket=pocket, box_size=args.box,
+        exhaustiveness=args.exhaustiveness, method=args.method,
+        model_path=args.model, dl_weight=args.dl_weight,
+        device="cuda" if _cuda_available() else "cpu", seed=args.seed)
+
+    def progress(stage, pct, msg):
+        print("[{:>3}%] [{}] {}".format(pct, stage, msg))
+
+    results = pipeline.run(progress=progress, save_dir=args.out,
+                           top_k=args.top_k)
+    print("\n==== 对接结果 ====")
+    print("{:>4s} {:>10s} {:>10s} {:>10s} {:>8s}".format(
+        "rank", "vina", "dl", "final", "cluster"))
+    for res in results:
+        dl = "-" if res.scores.get("dl") is None else \
+            "{:.2f}".format(res.scores["dl"])
+        print("{:>4d} {:>10.2f} {:>10s} {:>10.2f} {:>8d}".format(
+            res.rank, res.scores["vina"], dl, res.scores["final"],
+            res.cluster_size))
+    print("\n结果已写入: {}/".format(args.out))
+    return 0
+
+
+def cmd_train(args) -> int:
+    from .dl.train import train_egnn
+    summary = train_egnn(args.data, args.out, epochs=args.epochs,
+                         batch_size=args.batch_size, lr=args.lr,
+                         hidden_dim=args.hidden, n_layers=args.layers,
+                         device=args.device)
+    print(json_dump(summary))
+    return 0
+
+
+def cmd_web(args) -> int:
+    import web.app as web_app
+[第 34 页]
+
+    web_app.launch(host=args.host, port=args.port, model_path=args.model,
+                   workdir=args.workdir)
+    return 0
+
+
+def cmd_info(args) -> int:
+    import platform
+    print("ProteinDock v{} on Python {} ({})".format(
+        __version__, platform.python_version(), platform.system()))
+    try:
+        import numpy
+        print("numpy      {}".format(numpy.__version__))
+    except ImportError:
+        print("numpy      未安装")
+    try:
+        import scipy
+        print("scipy      {}".format(scipy.__version__))
+    except ImportError:
+        print("scipy      未安装")
+    try:
+        import rdkit
+        print("rdkit      {}".format(rdkit.__version__))
+    except ImportError:
+        print("rdkit      未安装")
+    try:
+        import torch
+        print("torch      {} (cuda: {})".format(
+            torch.__version__, torch.cuda.is_available()))
+    except ImportError:
+        print("torch      未安装")
+    return 0
+
+
+def json_dump(obj) -> str:
+    import json
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    handlers = {"dock": cmd_dock, "train": cmd_train,
+[第 35 页]
+
+                "web": cmd_web, "info": cmd_info}
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+/* ====== 文件: web/app.py ====== */
+# -*- coding: utf-8 -*-
+"""ProteinDock Web 可视化平台(Flask 后端)
+
+ 提供:
+   - 蛋白/配体文件上传或内置示例提交对接任务
+   - 后台线程池异步执行, 前端轮询进度
+   - 3D 结果展示(3Dmol.js, 本地静态资源)
+   - 打分明细 / 训练曲线 / 示例下载等 REST API
+"""
+
+import json
+import os
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+from flask import Flask, jsonify, render_template, request, send_from_directory
+
+from proteindock import __version__
+from proteindock.io.protein import parse_pdb
+from proteindock.io.ligand import load_ligand
+from proteindock.pipeline import DockingPipeline
+
+app = Flask(__name__)
+
+# 运行时由 launch() 注入配置
+STATE = {
+    "model_path": None,
+    "workdir": "web_jobs",
+    "device": "cpu",
+    "examples_dir": None,
+}
+JOBS = {}                       # job_id -> dict(status/progress/message/result)
+LOCK = threading.Lock()
+POOL = ThreadPoolExecutor(max_workers=2)
+
+
+# ---------------------------------------------------------------- 页面
+@app.route("/")
+def index():
+    return render_template("index.html", version=__version__)
+[第 36 页]
+
+
+
+# ---------------------------------------------------------------- API: 任务
+@app.route("/api/jobs", methods=["POST"])
+def create_job():
+    """创建对接任务(文件上传或选择内置示例)。"""
+    data = request.form
+    workdir = STATE["workdir"]
+    os.makedirs(os.path.join(workdir, "uploads"), exist_ok=True)
+    job_id = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
+
+    rec = request.files.get("receptor")
+    lig = request.files.get("ligand")
+    example = data.get("example")
+    if example:
+        ex_dir = STATE["examples_dir"]
+        if not ex_dir or not os.path.isdir(ex_dir):
+            return jsonify({"error": "示例不存在"}), 404
+        rec_path = os.path.join(ex_dir, example, "protein.pdb")
+        lig_path = os.path.join(ex_dir, example, "ligand.sdf")
+        if not (os.path.exists(rec_path) and os.path.exists(lig_path)):
+            return jsonify({"error": "示例文件缺失: " + example}), 404
+        job_dir = os.path.join(workdir, "jobs", job_id)
+        os.makedirs(job_dir, exist_ok=True)
+    else:
+        if rec is None or lig is None:
+            return jsonify({"error": "请同时上传蛋白 PDB 与配体 SDF"}), 400
+        job_dir = os.path.join(workdir, "jobs", job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        rec_path = os.path.join(job_dir, "input_receptor.pdb")
+        lig_path = os.path.join(job_dir, "input_ligand.sdf")
+        rec.save(rec_path)
+        lig.save(lig_path)
+        if os.path.getsize(rec_path) > 30 * 1024 * 1024:
+            return jsonify({"error": "蛋白文件过大(>30MB)"}), 400
+
+    params = {
+        "pocket": None,
+        "box_size": float(data.get("box_size", 24)),
+        "exhaustiveness": int(data.get("exhaustiveness", 8)),
+        "method": data.get("method", "hybrid"),
+        "dl_weight": float(data.get("dl_weight", 1.0)),
+        "seed": int(data.get("seed", 2025)),
+    }
+    if data.get("pocket"):
+        try:
+            params["pocket"] = [float(v) for v in
+                                data.get("pocket").split(",")]
+        except ValueError:
+            return jsonify({"error": "口袋坐标格式应为 x,y,z"}), 400
+[第 37 页]
+
+
+    with LOCK:
+        JOBS[job_id] = {
+            "status": "queued", "progress": 0, "stage": "queue",
+            "message": "排队中", "params": params, "dir": job_dir,
+            "created": time.time(),
+        }
+    POOL.submit(_run_docking_job, job_id, rec_path, lig_path, params)
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/jobs/<job_id>")
+def job_status(job_id):
+    with LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        return jsonify({"error": "任务不存在"}), 404
+    payload = {k: job.get(k) for k in
+               ("status", "progress", "stage", "message", "error", "result")}
+    return jsonify(payload)
+
+
+@app.route("/api/jobs/<job_id>/files/<path:name>")
+def job_file(job_id, name):
+    with LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        return jsonify({"error": "任务不存在"}), 404
+    # 注意: Flask 的 send_from_directory 会把相对目录解析为
+    # 相对 app.root_path(即 web/ 模块目录), 必须转绝对路径
+    out_dir = os.path.abspath(os.path.join(job["dir"], "output"))
+    if not os.path.isfile(os.path.join(out_dir, name)):
+        return jsonify({"error": "文件不存在"}), 404
+    return send_from_directory(out_dir, name, as_attachment=True)
+
+
+# ---------------------------------------------------------------- API: 元信息
+@app.route("/api/examples")
+def list_examples():
+    ex_dir = STATE["examples_dir"]
+    items = []
+    if ex_dir and os.path.isdir(ex_dir):
+        for name in sorted(os.listdir(ex_dir)):
+            meta = os.path.join(ex_dir, name, "meta.json")
+            info = {"id": name}
+            if os.path.exists(meta):
+                with open(meta, encoding="utf-8") as fh:
+                    info.update(json.load(fh))
+            items.append(info)
+    return jsonify({"examples": items})
+[第 38 页]
+
+
+
+@app.route("/api/model")
+def model_info():
+    """EGNN 模型元信息与训练曲线。"""
+    model_path = STATE["model_path"]
+    if not model_path or not os.path.exists(model_path):
+        return jsonify({"loaded": False})
+    history_path = os.path.join(os.path.dirname(model_path), "history.json")
+    history = None
+    if os.path.exists(history_path):
+        with open(history_path, encoding="utf-8") as fh:
+            history = json.load(fh)
+    return jsonify({"loaded": True, "path": model_path,
+                    "history": history})
+
+
+@app.route("/api/version")
+def version():
+    return jsonify({"name": "ProteinDock", "version": __version__,
+                    "device": STATE["device"]})
+
+
+# ---------------------------------------------------------------- 任务执行
+def _run_docking_job(job_id, rec_path, lig_path, params):
+    """线程池工作函数: 执行完整对接并写结果。"""
+    with LOCK:
+        JOBS[job_id].update(status="running", stage="prepare",
+                            progress=3, message="解析输入结构...")
+
+    def progress(stage, pct, msg):
+        with LOCK:
+            JOBS[job_id].update(stage=stage, progress=pct, message=msg)
+
+    try:
+        protein = parse_pdb(rec_path)
+        ligand = load_ligand(lig_path)
+        pipeline = DockingPipeline(
+            protein, ligand, pocket=params["pocket"],
+            box_size=params["box_size"],
+            exhaustiveness=params["exhaustiveness"],
+            method=params["method"],
+            model_path=STATE["model_path"],
+            dl_weight=params["dl_weight"],
+            device=STATE["device"], seed=params["seed"])
+        out_dir = os.path.join(JOBS[job_id]["dir"], "output")
+        results = pipeline.run(progress=progress, save_dir=out_dir)
+
+        # 结果 JSON(含各 pose 的 SDF 路径与打分明细)
+        result = {
+[第 39 页]
+
+            "n_atoms_protein": protein.n_atoms,
+            "n_atoms_ligand": ligand.n_atoms,
+            "n_torsions": ligand.n_torsions,
+            "stats": pipeline.stats,
+            "poses": [
+                {
+                    "rank": r.rank,
+                    "scores": r.scores,
+                    "cluster_size": r.cluster_size,
+                    "sdf": "pose_{}.sdf".format(r.rank),
+                } for r in results
+            ],
+            "complex_pdb": "complex_best.pdb",
+        }
+        with LOCK:
+            JOBS[job_id].update(status="done", progress=100, stage="done",
+                                message="对接完成", result=result)
+    except Exception as exc:              # noqa: BLE001 - 全量回传给前端
+        with LOCK:
+            JOBS[job_id].update(status="error", stage="error",
+                                message=str(exc), error=str(exc))
+
+
+# ---------------------------------------------------------------- 启动
+def launch(host="0.0.0.0", port=8000, model_path=None, workdir="web_jobs",
+           examples_dir=None):
+    """CLI 入口: 启动 Web 服务。"""
+    import torch
+    STATE["model_path"] = model_path
+    STATE["workdir"] = workdir
+    STATE["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    STATE["examples_dir"] = examples_dir or os.path.join(root, "examples")
+    os.makedirs(os.path.join(workdir, "jobs"), exist_ok=True)
+    print("ProteinDock Web v{} | device={} | model={}".format(
+        __version__, STATE["device"], model_path or "(纯经验打分)"))
+    print("示例目录: {}".format(STATE["examples_dir"]))
+    print("访问: http://{}:{}/  (Ctrl+C 退出)".format(
+        "127.0.0.1" if host == "0.0.0.0" else host, port))
+    app.run(host=host, port=port, threaded=True, debug=False)
+
+
+if __name__ == "__main__":
+    import sys
+    launch(port=int(sys.argv[1]) if len(sys.argv) > 1 else 8000)
+
+/* ====== 文件: web/static/app.js ====== */
+/* ProteinDock Web 前端逻辑: 任务提交 / 轮询 / 3D 渲染 / 图表 */
+"use strict";
+
+[第 40 页]
+
+const $ = (sel) => document.querySelector(sel);
+
+/* ---------------- 全局状态 ---------------- */
+const App = {
+  jobId: null,
+  pollTimer: null,
+  poses: [],
+  selectedPose: 0,
+  receptorPdb: "",      // 原始受体文本(渲染用)
+  viewer: null,
+  viewMode: "cartoon",
+};
+
+/* ---------------- 初始化 ---------------- */
+document.addEventListener("DOMContentLoaded", () => {
+  initTabs();
+  initDropzones();
+  loadExamples();
+  loadModelInfo();
+  loadVersion();
+  $("#btn-submit").addEventListener("click", submitJob);
+  $("#view-cartoon").onclick = () => setViewMode("cartoon");
+  $("#view-stick").onclick = () => setViewMode("stick");
+  $("#view-surface").onclick = () => setViewMode("surface");
+  $("#view-reset").onclick = () => { if (App.viewer) App.viewer.zoomTo(); };
+});
+
+function loadVersion() {
+  fetch("/api/version").then(r => r.json()).then(d => {
+    $("#version-badge").textContent = "v" + d.version;
+    $("#device-badge").textContent = d.device.toUpperCase() === "CUDA" ? "GPU 加速" : "CPU";
+    $("#device-badge").classList.toggle("gpu", d.device === "cuda");
+  }).catch(() => {});
+}
+
+/* ---------------- Tab 切换 ---------------- */
+function initTabs() {
+  document.querySelectorAll(".tab").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      $("#tab-example").classList.toggle("hidden", btn.dataset.tab !== "example");
+      $("#tab-upload").classList.toggle("hidden", btn.dataset.tab !== "upload");
+    });
+  });
+}
+
+/* ---------------- 文件上传区 ---------------- */
+function initDropzones() {
+  bindDrop("drop-receptor", "file-receptor", "name-receptor");
+[第 41 页]
+
+  bindDrop("drop-ligand", "file-ligand", "name-ligand");
+}
+function bindDrop(zoneId, inputId, nameId) {
+  const zone = $("#" + zoneId), input = $("#" + inputId);
+  zone.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => {
+    if (input.files.length) $("#" + nameId).textContent = input.files[0].name;
+  });
+  ["dragover", "dragenter"].forEach(ev =>
+    zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add("dragover"); }));
+  ["dragleave", "drop"].forEach(ev =>
+    zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.remove("dragover"); }));
+  zone.addEventListener("drop", e => {
+    if (e.dataTransfer.files.length) {
+      input.files = e.dataTransfer.files;
+      $("#" + nameId).textContent = e.dataTransfer.files[0].name;
+    }
+  });
+}
+
+/* ---------------- 示例与模型信息 ---------------- */
+function loadExamples() {
+  fetch("/api/examples").then(r => r.json()).then(d => {
+    const sel = $("#example-select");
+    sel.innerHTML = "";
+    App.examples = d.examples;
+    d.examples.forEach(ex => {
+      const opt = document.createElement("option");
+      opt.value = ex.id;
+      opt.textContent = ex.title || ex.id;
+      if (ex.description) opt.title = ex.description;
+      sel.appendChild(opt);
+    });
+    if (!d.examples.length) {
+      const opt = document.createElement("option");
+      opt.textContent = "(无内置示例)";
+      sel.appendChild(opt);
+    } else {
+      sel.selectedIndex = 0;        // listbox 模式不会自动选中第一项
+      fillExamplePocket(d.examples[0]);
+      sel.addEventListener("change", () => {
+        const ex = (App.examples || []).find(e => e.id === sel.value);
+        fillExamplePocket(ex);
+      });
+    }
+  }).catch(() => {});
+}
+
+/* 选中示例时自动填入推荐口袋坐标(来自晶体配体质心) */
+function fillExamplePocket(ex) {
+[第 42 页]
+
+  if (ex && ex.pocket) {
+    $("#param-pocket").value = ex.pocket.map(v => v.toFixed(1)).join(",");
+  }
+}
+
+function loadModelInfo() {
+  fetch("/api/model").then(r => r.json()).then(d => {
+    if (!d.loaded) return;
+    const s = d.history && d.history.summary;
+    $("#model-summary").innerHTML =
+      "EGNN 等变图神经网络已加载 (epochs " + (s ? s.epochs : "?") +
+      ", val loss " + (s ? s.best_val_loss.toFixed(4) : "?") +
+      ", 训练体系 " + (s ? s.n_systems : "?") + " 个)";
+    if (d.history && d.history.history) drawLossCurve(d.history.history);
+  }).catch(() => {});
+}
+
+/* ---------------- 任务提交与轮询 ---------------- */
+function submitJob() {
+  const useExample = !$("#tab-example").classList.contains("hidden");
+  const fd = new FormData();
+  if (useExample) {
+    const ex = $("#example-select").value;
+    if (!ex) return alert("请选择示例体系");
+    fd.append("example", ex);
+  } else {
+    const r = $("#file-receptor").files[0], l = $("#file-ligand").files[0];
+    if (!r || !l) return alert("请上传蛋白 PDB 与配体文件");
+    fd.append("receptor", r); fd.append("ligand", l);
+  }
+  fd.append("method", $("#param-method").value);
+  fd.append("exhaustiveness", $("#param-exhaustiveness").value);
+  fd.append("box_size", $("#param-box").value);
+  fd.append("dl_weight", $("#param-dlweight").value);
+  const pocket = $("#param-pocket").value.trim();
+  if (pocket) fd.append("pocket", pocket);
+
+  $("#btn-submit").disabled = true;
+  $("#progress-wrap").classList.add("active");
+  setProgress(0, "queue", "提交任务...");
+  fetch("/api/jobs", { method: "POST", body: fd })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) throw new Error(d.error);
+      App.jobId = d.job_id;
+      pollStatus();
+    })
+    .catch(e => {
+      setProgress(0, "error", e.message);
+      $("#btn-submit").disabled = false;
+[第 43 页]
+
+    });
+}
+
+function pollStatus() {
+  App.pollTimer = setInterval(() => {
+    fetch("/api/jobs/" + App.jobId).then(r => r.json()).then(job => {
+      setProgress(job.progress || 0, job.stage, job.message);
+      if (job.status === "done") {
+        clearInterval(App.pollTimer);
+        onJobDone(job);
+      } else if (job.status === "error") {
+        clearInterval(App.pollTimer);
+        setProgress(100, "error", "失败: " + job.error);
+      }
+    }).catch(() => {});
+  }, 1500);
+}
+
+/* 阶段名中文映射 */
+const STAGE_LABELS = {
+  queue: "排队中", prepare: "解析输入", grid: "构建打分网格",
+  search: "构象搜索", cluster: "聚类去重", rescore: "深度学习重打分",
+  done: "已完成", error: "失败",
+};
+
+function setProgress(pct, stage, msg) {
+  $("#progress-fill").style.width = pct + "%";
+  $("#progress-pct").textContent = pct + "%";
+  $("#progress-stage").textContent = STAGE_LABELS[stage] || stage;
+  $("#progress-msg").textContent = msg || "";
+}
+
+/* ---------------- 结果展示 ---------------- */
+function onJobDone(job) {
+  $("#btn-submit").disabled = false;
+  App.poses = job.result.poses;
+  App.selectedPose = 0;
+
+  // 结果表
+  const tbody = $("#result-table tbody");
+  tbody.innerHTML = "";
+  job.result.poses.forEach(p => {
+    const tr = document.createElement("tr");
+    tr.className = "data-row" + (p.rank === 1 ? " selected" : "");
+    tr.dataset.rank = p.rank;
+    const dl = p.scores.dl === null ? "-" : p.scores.dl.toFixed(2);
+    tr.innerHTML = "<td>" + p.rank + "</td><td>" + p.scores.vina.toFixed(2) +
+      "</td><td>" + dl + "</td><td><b>" + p.scores.final.toFixed(2) +
+      "</b></td><td>" + p.cluster_size + "</td>";
+    tr.addEventListener("click", () => selectPose(p.rank));
+[第 44 页]
+
+    tbody.appendChild(tr);
+  });
+
+  // 统计信息
+  const st = job.result.stats;
+  $("#stats-box").textContent =
+    "蛋白重原子: " + job.result.n_atoms_protein +
+    "\n配体重原子: " + job.result.n_atoms_ligand +
+    "\n可旋转键: " + job.result.n_torsions +
+    "\n口袋中心: " + st.pocket_center.map(v => v.toFixed(1)).join(", ") +
+    "\n搜索策略: " + st.method + " × " + st.n_runs + " 次独立搜索" +
+    "\n聚类代表构象: " + st.n_cluster_representatives +
+    "\nDL 模型: " + (st.dl_model_loaded ? "已加载" : "未加载") +
+    "\n总耗时: " + st.elapsed_seconds + " s";
+
+  // 3D 展示最优 pose
+  renderResult(job.result);
+  drawEnergy(job.result.poses[0]);
+}
+
+async function selectPose(rank) {
+  App.selectedPose = rank;
+  document.querySelectorAll(".result-table tr.data-row").forEach(tr => {
+    tr.classList.toggle("selected", Number(tr.dataset.rank) === rank);
+  });
+  const pose = App.poses.find(p => p.rank === rank);
+  if (!pose) return;
+  const resp = await fetch("/api/jobs/" + App.jobId + "/files/" + pose.sdf);
+  const sdfText = await resp.text();
+  renderLigandPose(sdfText);
+  drawEnergy(pose);
+}
+
+/* ---------------- 3D 渲染 ---------------- */
+function initViewer() {
+  const el = $("#viewer");
+  el.innerHTML = "";
+  App.viewer = $3Dmol.createViewer(el, { backgroundColor: "#0a0e15" });
+  return App.viewer;
+}
+
+async function renderResult(result) {
+  const v = initViewer();
+  const pdbResp = await fetch("/api/jobs/" + App.jobId + "/files/complex_best.pdb");
+  const pdbText = await pdbResp.text();
+  App.receptorPdb = pdbText.replace(/HETATM.*LIG.*\n/g, "");
+  applyViewMode();
+  const sdfResp = await fetch("/api/jobs/" + App.jobId + "/files/pose_1.sdf");
+  renderLigandPose(await sdfResp.text());
+}
+[第 45 页]
+
+
+function renderLigandPose(sdfText) {
+  const v = App.viewer;
+  if (v.$ligand) v.removeModel(v.$ligand);
+  const lig = v.addModel(sdfText, "sdf");
+  v.$ligand = lig;
+  lig.setStyle({}, { stick: { colorscheme: "goldCarbon", radius: 0.16 } });
+  v.render();
+}
+
+function applyViewMode() {
+  const v = App.viewer;
+  if (!v || !App.receptorPdb) return;
+  if (v.$receptor) v.removeModel(v.$receptor);
+  const rec = v.addModel(App.receptorPdb, "pdb");
+  v.$receptor = rec;
+  if (App.viewMode === "cartoon") {
+    rec.setStyle({}, { cartoon: { color: "spectrum" } });
+  } else if (App.viewMode === "stick") {
+    rec.setStyle({}, { stick: { colorscheme: "cyanCarbon", radius: 0.08 },
+                       line: { color: "#3d4a66" } });
+  } else if (App.viewMode === "surface") {
+    rec.setStyle({}, {});
+    v.addSurface($3Dmol.SurfaceType.VDW, {
+      opacity: 0.85, color: "#4f8cff"
+    }, { model: rec });
+  }
+  v.zoomTo({ model: rec });
+  v.render();
+}
+
+function setViewMode(mode) {
+  App.viewMode = mode;
+  document.querySelectorAll(".viewer-controls .chip").forEach(c =>
+    c.classList.remove("active"));
+  $("#view-" + mode).classList.add("active");
+  if (App.viewer) {
+    App.viewer.removeAllSurfaces();
+    applyViewMode();
+    if (App.viewer.$ligand) renderLigandPoseLast();
+  }
+}
+
+function renderLigandPoseLast() {
+  /* 视角切换后保持配体可见(最近一次 pose 已在 viewer 中) */
+  App.viewer.render();
+}
+
+/* ---------------- 图表 ---------------- */
+function drawEnergy(pose) {
+[第 46 页]
+
+  // 注意: 服务端 report.json 里有五项分解, 前端先用总分近似展示
+  const canvas = $("#energy-canvas");
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $("#energy-pose-label").textContent = "pose #" + pose.rank;
+  const items = [
+    ["经验总分", pose.scores.vina, "#4f8cff"],
+    ["相互作用", pose.scores.vina_inter, "#22c1a4"],
+    ["配体内能", pose.scores.vina_intra, "#f5a623"],
+  ];
+  if (pose.scores.dl !== null && pose.scores.dl !== undefined)
+    items.push(["EGNN 分", pose.scores.dl, "#c084fc"]);
+  drawBars(ctx, items, canvas);
+}
+
+function drawBars(ctx, items, canvas) {
+  const w = canvas.width, h = canvas.height, pad = 34;
+  const vmin = Math.min(0, ...items.map(i => i[1]));
+  const vmax = Math.max(0.1, ...items.map(i => i[1]));
+  const y0 = h - pad;
+  const scale = (h - pad * 2) / (vmax - vmin);
+  ctx.strokeStyle = "#3a4560";
+  ctx.beginPath(); ctx.moveTo(pad, y0 - (0 - vmin) * scale);
+  ctx.lineTo(w - 8, y0 - (0 - vmin) * scale); ctx.stroke();
+  const bw = (w - pad * 2) / items.length * 0.55;
+  items.forEach((it, i) => {
+    const cx = pad + (w - pad * 2) * (i + 0.5) / items.length;
+    const val = it[1];
+    const yTop = y0 - (Math.max(val, 0) - vmin) * scale;
+    const yBot = y0 - (Math.min(val, 0) - vmin) * scale;
+    ctx.fillStyle = it[2];
+    ctx.fillRect(cx - bw / 2, yTop, bw, Math.max(yBot - yTop, 2));
+    ctx.fillStyle = "#8b93a7";
+    ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(it[0], cx, h - 12);
+    ctx.fillText(val.toFixed(2), cx, yTop - 6);
+  });
+}
+
+function drawLossCurve(history) {
+  const canvas = $("#loss-canvas");
+  canvas.classList.remove("hidden");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height, pad = 30;
+  ctx.clearRect(0, 0, w, h);
+  const all = history.train.concat(history.val);
+  const vmax = Math.max(...all), vmin = Math.min(...all);
+  const x = (i, n) => pad + (w - pad * 1.4) * i / Math.max(n - 1, 1);
+  const y = (v) => h - pad - (h - pad * 1.8) * (v - vmin) / Math.max(vmax - vmin, 1e-6);
+  [["train", "#4f8cff"], ["val", "#22c1a4"]].forEach(([key, color]) => {
+[第 47 页]
+
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    history[key].forEach((v, i) => {
+      const px = x(i, history[key].length), py = y(v);
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+  });
+  ctx.fillStyle = "#8b93a7"; ctx.font = "11px sans-serif";
+  ctx.fillText("train (蓝) / val (绿) loss", pad, 16);
+}
+
+/* ====== 文件: web/static/style.css ====== */
+/* ProteinDock Web 平台样式 - 深色科技风 */
+:root {
+  --bg: #0d1117;
+  --panel: #161b26;
+  --panel-2: #1c2333;
+  --border: #2a3247;
+  --text: #e6e9f0;
+  --muted: #8b93a7;
+  --accent: #4f8cff;
+  --accent-2: #22c1a4;
+  --danger: #ff6b6b;
+  --radius: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+  min-height: 100vh; display: flex; flex-direction: column;
+}
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 22px; border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #131926, #0d1117);
+}
+.brand { display: flex; align-items: center; gap: 14px; }
+.logo {
+  width: 46px; height: 46px; border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 18px; color: #fff; letter-spacing: 1px;
+}
+.brand-text h1 { font-size: 19px; font-weight: 700; }
+.brand-text h1 small { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
+.brand-text p { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.topmeta { display: flex; gap: 8px; }
+.badge {
+[第 48 页]
+
+  padding: 4px 12px; border-radius: 999px; font-size: 12px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+}
+.badge.gpu { color: var(--accent-2); border-color: rgba(34,193,164,.4); }
+
+/* ---------- 布局 ---------- */
+.layout {
+  display: grid; grid-template-columns: 320px 1fr 340px;
+  gap: 16px; padding: 16px 22px; flex: 1; min-height: 0;
+}
+.panel {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px; overflow-y: auto;
+}
+.panel h2 { font-size: 14px; color: var(--muted); margin: 14px 0 10px; text-transform: uppercase; letter-spacing: .06em; }
+.panel h2:first-child { margin-top: 0; }
+.panel h2 small { color: var(--accent); text-transform: none; letter-spacing: 0; }
+
+/* ---------- 输入面板 ---------- */
+.tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+.tab {
+  flex: 1; padding: 8px 0; border-radius: 8px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 13px;
+}
+.tab.active { background: var(--panel-2); color: var(--text); border-color: var(--accent); }
+.tab-body.hidden, .hidden { display: none; }
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+select, input[type="number"], input[type="text"] {
+  width: 100%; margin-top: 4px; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  font-size: 13px; outline: none;
+}
+select[size] { padding: 6px; }
+select[size] option { padding: 8px 6px; border-radius: 6px; }
+select[size] option:checked { background: var(--accent); color: #fff; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+.form-grid .wide { grid-column: 1 / -1; }
+
+.dropzone {
+  border: 1.5px dashed var(--border); border-radius: 10px; padding: 18px 10px;
+  text-align: center; cursor: pointer; margin-bottom: 10px; transition: border-color .2s;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.dropzone:hover, .dropzone.dragover { border-color: var(--accent); }
+.dz-hint { color: var(--muted); font-size: 12px; }
+.dz-name { color: var(--accent-2); font-size: 12px; word-break: break-all; }
+
+button.primary {
+  width: 100%; margin-top: 14px; padding: 12px; border: none; border-radius: 10px;
+  background: linear-gradient(135deg, var(--accent), #6f5bff);
+[第 49 页]
+
+  color: #fff; font-size: 15px; font-weight: 600; cursor: pointer;
+  transition: filter .2s, transform .1s;
+}
+button.primary:hover { filter: brightness(1.1); }
+button.primary:active { transform: scale(.98); }
+button.primary:disabled { filter: grayscale(.6); cursor: not-allowed; }
+
+.progress-wrap { margin-top: 14px; display: none; }
+.progress-wrap.active { display: block; }
+.progress-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.progress-bar { height: 8px; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+.progress-fill {
+  height: 100%; width: 0%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width .5s ease;
+}
+.progress-msg { font-size: 12px; color: var(--accent-2); margin-top: 6px; min-height: 16px; }
+
+/* ---------- 3D 视图 ---------- */
+.viewer-panel { display: flex; flex-direction: column; padding: 0; }
+.viewer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px 10px;
+}
+.viewer-head h2 { margin: 0; }
+.viewer-controls { display: flex; gap: 6px; }
+.chip {
+  padding: 5px 12px; border-radius: 999px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--muted);
+}
+.chip.active { background: var(--panel-2); color: var(--accent); border-color: var(--accent); }
+#viewer { flex: 1; position: relative; min-height: 420px; background: #0a0e15; }
+.viewer-legend {
+  display: flex; gap: 18px; padding: 10px 18px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 12px;
+}
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+.dot.lig { background: #ffd23f; }
+.dot.poc { background: #4f8cff; }
+
+/* ---------- 结果面板 ---------- */
+.result-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.result-table th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+  padding: 6px 8px; border-bottom: 1px solid var(--border);
+}
+.result-table td { padding: 8px; border-bottom: 1px solid rgba(42,50,71,.5); }
+.result-table tr.data-row { cursor: pointer; }
+.result-table tr.data-row:hover, tr.data-row.selected { background: var(--panel-2); }
+.result-table tr.selected td { color: var(--accent); }
+[第 50 页]
+
+.empty-row td { color: var(--muted); text-align: center; padding: 20px 0; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+canvas { width: 100%; background: var(--panel-2); border-radius: 10px; margin-top: 6px; }
+.stats { line-height: 1.9; white-space: pre-line; }
+#model-summary { margin-bottom: 6px; }
+
+footer {
+  text-align: center; color: var(--muted); font-size: 11px;
+  padding: 12px; border-top: 1px solid var(--border);
+}
+
+/* 响应式 */
+@media (max-width: 1200px) {
+  .layout { grid-template-columns: 300px 1fr; }
+  .result-panel { grid-column: 1 / -1; }
+}
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+}
+
+/* ====== 文件: web/templates/index.html ====== */
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ProteinDock · 蛋白质-小分子对接平台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">PD</span>
+    <div class="brand-text">
+      <h1>ProteinDock <small>蛋白质-小分子对接平台</small></h1>
+      <p>深度学习打分 · 混合构象搜索 · 交互式 3D 可视化</p>
+    </div>
+  </div>
+  <div class="topmeta">
+    <span id="version-badge" class="badge">v1.0</span>
+    <span id="device-badge" class="badge gpu">GPU</span>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左侧: 输入与参数 -->
+  <section class="panel input-panel">
+    <h2>对接任务</h2>
+    <div class="tabs">
+[第 51 页]
+
+      <button class="tab active" data-tab="example">内置示例</button>
+      <button class="tab" data-tab="upload">上传文件</button>
+    </div>
+
+    <div id="tab-example" class="tab-body">
+      <label>选择示例体系</label>
+      <select id="example-select" size="5"></select>
+    </div>
+
+    <div id="tab-upload" class="tab-body hidden">
+      <label>蛋白质结构 (PDB)</label>
+      <div class="dropzone" id="drop-receptor">
+        <input type="file" id="file-receptor" accept=".pdb" hidden>
+        <span class="dz-hint">点击或拖入 .pdb 文件</span>
+        <span class="dz-name" id="name-receptor"></span>
+      </div>
+      <label>配体分子 (SDF / MOL2)</label>
+      <div class="dropzone" id="drop-ligand">
+        <input type="file" id="file-ligand" accept=".sdf,.mol2,.pdb" hidden>
+        <span class="dz-hint">点击或拖入配体文件</span>
+        <span class="dz-name" id="name-ligand"></span>
+      </div>
+    </div>
+
+    <h2>搜索参数</h2>
+    <div class="form-grid">
+      <label>搜索策略
+        <select id="param-method">
+          <option value="hybrid" selected>混合(GA+MC-SA)</option>
+          <option value="mc_sa">蒙特卡洛模拟退火</option>
+          <option value="ga">遗传算法</option>
+        </select>
+      </label>
+      <label>独立搜索次数
+        <input type="number" id="param-exhaustiveness" value="8"
+               min="1" max="64" step="1">
+      </label>
+      <label>盒子边长 (Å)
+        <input type="number" id="param-box" value="24" min="16" max="40" step="2">
+      </label>
+      <label>DL 打分权重
+        <input type="number" id="param-dlweight" value="1.0" min="0" max="3" step="0.1">
+      </label>
+      <label class="wide">口袋中心 (留空自动检测, 格式 x,y,z)
+        <input type="text" id="param-pocket" placeholder="例如 12.3,45.6,78.9">
+      </label>
+    </div>
+
+    <button id="btn-submit" class="primary">开始对接</button>
+
+[第 52 页]
+
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-label">
+        <span id="progress-stage">就绪</span>
+        <span id="progress-pct">0%</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+      <p class="progress-msg" id="progress-msg"></p>
+    </div>
+  </section>
+
+  <!-- 中间: 3D 视图 -->
+  <section class="panel viewer-panel">
+    <div class="viewer-head">
+      <h2>3D 结构视图</h2>
+      <div class="viewer-controls">
+        <button id="view-cartoon" class="chip active">Cartoon</button>
+        <button id="view-stick" class="chip">Stick</button>
+        <button id="view-surface" class="chip">Surface</button>
+        <button id="view-reset" class="chip">重置视角</button>
+      </div>
+    </div>
+    <div id="viewer"></div>
+    <div class="viewer-legend">
+      <span><i class="dot lig"></i>对接配体 pose</span>
+      <span><i class="dot poc"></i>口袋残基</span>
+    </div>
+  </section>
+
+  <!-- 右侧: 结果 -->
+  <section class="panel result-panel">
+    <h2>对接结果</h2>
+    <table class="result-table" id="result-table">
+      <thead>
+        <tr><th>#</th><th>经验分</th><th>DL 分</th><th>融合分</th><th>簇</th></tr>
+      </thead>
+      <tbody><tr class="empty-row"><td colspan="5">暂无结果, 请提交任务</td></tr></tbody>
+    </table>
+
+    <h2>能量分解 <small id="energy-pose-label"></small></h2>
+    <canvas id="energy-canvas" width="360" height="220"></canvas>
+    <p class="muted small">经验打分通道的五项能量分解 (kcal/mol)</p>
+
+    <h2>深度学习模型</h2>
+    <div id="model-summary" class="muted small">未加载 EGNN 模型(纯经验打分模式)</div>
+    <canvas id="loss-canvas" width="360" height="180" class="hidden"></canvas>
+
+    <h2>运行信息</h2>
+    <div id="stats-box" class="stats muted small">等待任务...</div>
+  </section>
+</main>
+[第 53 页]
+
+
+<footer>
+  ProteinDock v1.0 · 温州大学大学生创新创业训练计划项目 ·
+  EGNN 深度学习打分 / MC-SA + GA 混合搜索 / Vina 式经验打分
+</footer>
+
+<script src="/static/3dmol.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
+
+/* ====== 文件: scripts/build_dataset.py ====== */
+# -*- coding: utf-8 -*-
+"""构建 EGNN 训练数据集(dockdata 格式)
+
+ 流程:
+   1. 从 RCSB 下载一批经典蛋白-配体复合物(PDB)
+   2. 拆分: 去配体蛋白 protein.pdb + 晶体配体 ligand.sdf
+   3. 以晶体配体为 native, 刚体/扭转随机扰动生成 K 个 decoy pose
+   4. 用 Vina 式经验打分函数为每个 pose 打教师标签(知识蒸馏)
+   5. 落盘为 dockdata 格式供 proteindock.dl.dataset 加载
+
+ 用法: python scripts/build_dataset.py --out datasets/dockdata --n-decoys 24
+"""
+
+import argparse
+import os
+import sys
+import urllib.request
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from proteindock.io.protein import parse_pdb, Protein
+from proteindock.io.ligand import build_ligand
+from proteindock.scoring.vina_sf import intermolecular_energy
+from proteindock.search.mc_sa import Pose
+from proteindock.chemistry.geometry import random_quaternion
+
+# 经典药物靶标复合物(PDB ID), 含亲和力数据丰富的主流体系
+PDB_IDS = [
+    "1HVR",   # HIV-1 蛋白酶 / ritonavir
+    "1DWD",   # 凝血酶 / D-Phe-Pro-Arg
+    "1BTY",   # 胰蛋白酶 / benzamidine
+    "1AKZ",   # HIV 蛋白酶 / 抑制剂
+    "3ERT",   # 雌激素受体 / raloxifene
+    "2BST",   # β-分泌酶
+    "1OWH",   # CDK2
+    "1M17",   # EGFR / erlotinib
+[第 54 页]
+
+    "1UWH",   # p38 MAP 激酶
+    "3GCS",   # 激酶抑制剂
+    "1SQN",   # 碳酸酐酶
+    "2Z5U",   # 磷酸二酯酶
+    "1K1J",   # 凝血因子 Xa
+    "1R9O",   # 神经氨酸酶 / 奥司他韦
+    "3CL0",   # SARS-CoV-2 主蛋白酶样体系
+]
+
+RCSB_URL = "https://files.rcsb.org/download/{}.pdb"
+
+
+def download_pdb(pdb_id: str, dest: str) -> bool:
+    """从 RCSB 下载 PDB 文件。"""
+    url = RCSB_URL.format(pdb_id.upper())
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ProteinDock/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+    except Exception as exc:
+        print("下载失败 {}: {}".format(pdb_id, exc))
+        return False
+    with open(dest, "wb") as fh:
+        fh.write(data)
+    return True
+
+
+def split_complex(pdb_path: str, min_lig_atoms: int = 5):
+    """把复合物 PDB 拆为蛋白文本与晶体配体 HETATM 块。
+
+    选择规则: 收集全部非水/非辅基 HETATM 残基,
+    取原子数不少于 min_lig_atoms 的第一个(通常是主配体)。
+    """
+    protein_lines, het_by_res = [], {}
+    skip = {"HOH", "WAT", "SO4", "GOL", "EDO", "NAG", "MAN", "CL",
+            "NA", "MG", "ZN", "CA", "K", "ACT", "MES", "TRS", "PEG",
+            "DMS", "EOH", "IPA", "FMT", "ACE"}
+    with open(pdb_path, encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            rec = line[:6].strip()
+            if rec == "ATOM":
+                protein_lines.append(line)
+            elif rec == "HETATM":
+                res = line[17:20].strip().upper()
+                if res in skip:
+                    continue
+                het_by_res.setdefault(res, []).append(line)
+    lig_res, lig_lines = None, []
+    for res, lines in het_by_res.items():
+        if len(lines) >= min_lig_atoms:
+[第 55 页]
+
+            lig_res, lig_lines = res, lines
+            break
+    if lig_res is None and het_by_res:      # 回退: 原子最多的 HETATM
+        lig_res = max(het_by_res, key=lambda r: len(het_by_res[r]))
+        lig_lines = het_by_res[lig_res]
+    lig_pdb = "".join(lig_lines) + "END\n"
+    return "".join(protein_lines) + "TER\nEND\n", lig_pdb, lig_res
+
+
+def write_tmp(text: str, path: str):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def build_systems(out_root: str, n_decoys: int, max_atoms=70):
+    """逐体系构造 dockdata 目录。"""
+    from rdkit import Chem
+    os.makedirs(out_root, exist_ok=True)
+    tmp_dir = os.path.join(out_root, "_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    built = 0
+    for pdb_id in PDB_IDS:
+        sys_dir = os.path.join(out_root, pdb_id.lower())
+        if os.path.isdir(sys_dir) and os.path.exists(
+                os.path.join(sys_dir, "labels.npy")):
+            print("跳过已存在: {}".format(sys_dir))
+            built += 1
+            continue
+        raw = os.path.join(tmp_dir, pdb_id + ".pdb")
+        if not os.path.exists(raw) and not download_pdb(pdb_id, raw):
+            continue
+        try:
+            protein_text, lig_pdb, lig_res = split_complex(raw)
+            if not lig_pdb.strip() or lig_res is None:
+                print("{} 无配体, 跳过".format(pdb_id))
+                continue
+            write_tmp(protein_text, os.path.join(tmp_dir, "p.pdb"))
+            write_tmp(lig_pdb, os.path.join(tmp_dir, "l.pdb"))
+            protein = parse_pdb(os.path.join(tmp_dir, "p.pdb"))
+            lig_mol = Chem.MolFromPDBFile(os.path.join(tmp_dir, "l.pdb"),
+                                          removeHs=True, sanitize=True,
+                                          proximityBonding=True)
+            if lig_mol is None or lig_mol.GetNumAtoms() < 5 \
+                    or lig_mol.GetNumAtoms() > max_atoms:
+                print("{} 配体无效/过大({})".format(
+                    pdb_id, lig_mol.GetNumAtoms() if lig_mol else 0))
+                continue
+            # 原位配体(保留晶体坐标, native pose / 标签用)
+            ligand = build_ligand(lig_mol, name=pdb_id, keep_origin=True)
+            # 居中副本(刚体 Pose 采样假设质心坐标系)
+[第 56 页]
+
+            ligand_c = build_ligand(lig_mol, name=pdb_id)
+            native = ligand.coords + 0.0
+            center = native.mean(axis=0)
+
+            # decoys: native 附近小扰动 + 远处随机 pose
+            rng = np.random.default_rng(42)
+            from proteindock.chemistry.geometry import quaternion_rotate
+            lig_center = native.mean(axis=0)
+            poses = [native]
+            for k in range(n_decoys):
+                if k < n_decoys // 3:   # near-native 扰动(绕质心小幅刚体扰动)
+                    q = random_quaternion(rng)
+                    moved = quaternion_rotate(q, native - lig_center) + lig_center
+                    moved += rng.normal(0, 0.6, size=3)
+                    poses.append(moved)
+                else:                    # 远处 pose: 刚体打散 + 扭转随机
+                    pose = Pose.random(ligand_c, center, 16.0, rng)
+                    poses.append(pose.coords(ligand_c))
+
+            labels = []
+            for coords in poses:
+                d = np.sqrt(((coords[:, None, :] - protein.coords[None, :, :]) ** 2)
+                            .sum(axis=2))
+                pocket = d.min(axis=1) < 12.0
+                if not pocket.any():     # 远离蛋白的 pose 给平庸标签
+                    labels.append(0.0)
+                    continue
+                total, _ = intermolecular_energy(
+                    ligand_c.type_ids, protein.type_ids, d)
+                labels.append(float(total))
+            labels = np.array(labels, dtype=np.float32)
+
+            os.makedirs(sys_dir, exist_ok=True)
+            with open(os.path.join(sys_dir, "protein.pdb"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(protein_text)
+            from proteindock.io.ligand import write_sdf
+            write_sdf(ligand, native, os.path.join(sys_dir, "ligand.sdf"),
+                      name=pdb_id + "_native")
+            np.save(os.path.join(sys_dir, "decoys.npy"),
+                    np.array(poses, dtype=np.float32))
+            np.save(os.path.join(sys_dir, "labels.npy"), labels)
+            print("构建完成 {} (decoys={}, 标签范围 {:.1f}~{:.1f})".format(
+                pdb_id, len(poses), labels.min(), labels.max()))
+            built += 1
+        except Exception as exc:
+            print("{} 处理失败: {}".format(pdb_id, exc))
+    print("共构建 {} 个体系 -> {}".format(built, out_root))
+    return built
+
+[第 57 页]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="datasets/dockdata")
+    ap.add_argument("--n-decoys", type=int, default=24)
+    args = ap.parse_args()
+    build_systems(args.out, args.n_decoys)
+
+
+if __name__ == "__main__":
+    main()
+
+/* ====== 文件: scripts/make_docs.py ====== */
+# -*- coding: utf-8 -*-
+"""软件著作权申请材料生成
+
+ 1. 源代码文档: 按中国版权保护中心要求, 提交前 30 页 + 后 30 页
+    (每页 50 行), 自动汇总项目源码并排版为 txt;
+ 2. 软件登记信息表骨架(名称/版本/开发环境等自动填充)。
+
+ 用法: python scripts/make_docs.py --out docs/软著材料
+"""
+
+import argparse
+import os
+import sys
+from datetime import date
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 源代码收集顺序(核心引擎在前, 前端在后)
+SOURCE_FILES = [
+    "proteindock/__init__.py",
+    "proteindock/chemistry/elements.py",
+    "proteindock/chemistry/atom_types.py",
+    "proteindock/chemistry/geometry.py",
+    "proteindock/io/protein.py",
+    "proteindock/io/ligand.py",
+    "proteindock/scoring/vina_sf.py",
+    "proteindock/scoring/grid.py",
+    "proteindock/scoring/hybrid.py",
+    "proteindock/search/mc_sa.py",
+    "proteindock/search/genetic.py",
+    "proteindock/dl/features.py",
+    "proteindock/dl/model.py",
+    "proteindock/dl/dataset.py",
+    "proteindock/dl/train.py",
+    "proteindock/pipeline.py",
+    "proteindock/cli.py",
+    "web/app.py",
+[第 58 页]
+
+    "web/static/app.js",
+    "web/static/style.css",
+    "web/templates/index.html",
+    "scripts/build_dataset.py",
+    "scripts/make_docs.py",
+]
+
+LINES_PER_PAGE = 50
+PAGES_EACH_SIDE = 30
+HEADER = """
+{title}
+源 程 序
+
+软件名称: {name}
+版本号: V1.0
+共 {total_lines} 行 / {total_pages} 页
+本文件包含前 {front_pages} 页与后 {back_pages} 页源程序
+生成日期: {today}
+===============================================================
+"""
+
+
+def collect_lines():
+    """按顺序收集全部源代码行(带文件分隔注释)。"""
+    lines = []
+    for rel in SOURCE_FILES:
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            print("警告: 缺少 {}".format(rel))
+            continue
+        lines.append("/* ====== 文件: {} ====== */".format(rel))
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                text = raw.rstrip("\n")
+                # 屏蔽个人路径信息
+                text = text.replace("/**/", "/**/")
+                lines.append(text if text.strip() else "")
+        lines.append("")
+    return lines
+
+
+def make_source_doc(out_dir, title):
+    lines = collect_lines()
+    total_pages = (len(lines) + LINES_PER_PAGE - 1) // LINES_PER_PAGE
+    os.makedirs(out_dir, exist_ok=True)
+    header = HEADER.format(
+        title=title, name=title, total_lines=len(lines),
+        total_pages=total_pages, front_pages=PAGES_EACH_SIDE,
+        back_pages=PAGES_EACH_SIDE, today=date.today().isoformat())
+
+[第 59 页]
+
+    front = lines[:PAGES_EACH_SIDE * LINES_PER_PAGE]
+    back = lines[-PAGES_EACH_SIDE * LINES_PER_PAGE:] if total_pages > 60 else []
+    doc_lines = header.splitlines() + [""] + front
+    if back:
+        doc_lines += ["", "......(中间部分略)......", ""] + back
+
+    path = os.path.join(out_dir, "源代码_前30页后30页.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        for i in range(0, len(doc_lines), LINES_PER_PAGE):
+            page_no = i // LINES_PER_PAGE + 1
+            page = doc_lines[i:i + LINES_PER_PAGE]
+            fh.write("\n".join(page) + "\n")
+            fh.write("[第 {} 页]\n\n".format(page_no))
+    print("源代码文档: {} (总行数 {} => {} 页)".format(
+        path, len(lines), total_pages))
+    return path, len(lines), total_pages
+
+
+def make_info_sheet(out_dir, title, n_lines, n_pages):
+    """软件登记基本信息表骨架。"""
+    info = """# 软件著作权登记信息(草稿)
+
+软件全称: {title}
+软件简称: ProteinDock
+版本号: V1.0
+开发完成日期: {today}
+首次发表日期: 未发表
+开发方式: 独立开发(大学生创新创业训练计划项目成果)
+软件用途与技术特点:
+  本软件面向药物设计场景, 提供蛋白质-小分子分子对接计算平台。
+  集成 Vina 式五项物理经验打分函数、E(n) 等变图神经网络(EGNN)
+  深度学习打分模型、蒙特卡洛模拟退火与遗传算法混合构象搜索、
+  打分网格加速与 WebGL 三维交互可视化, 支持 Web 与命令行双模式。
+
+源程序量: {n_lines} 行(约 {n_pages} 页, 每页 50 行)
+开发环境:
+  操作系统: Ubuntu 22.04 (NVIDIA Tesla V100 GPU 服务器)
+  编程语言: Python 3.10 / JavaScript (ES6)
+  核心依赖: NumPy, SciPy, RDKit, PyTorch, Flask, 3Dmol.js
+运行环境:
+  操作系统: Linux / macOS / Windows
+  Python 3.8+, 支持 CUDA 的 NVIDIA GPU(可选, CPU 亦可运行)
+""".format(title=title, today=date.today().isoformat(),
+           n_lines=n_lines, n_pages=n_pages)
+    path = os.path.join(out_dir, "软件登记信息表_草稿.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(info)
+    print("登记信息表: {}".format(path))
+    return path
+
+[第 60 页]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=os.path.join(ROOT, "docs", "软著材料"))
+    ap.add_argument("--title",
+                    default="基于深度学习打分的蛋白质-小分子对接平台软件")
+    args = ap.parse_args()
+    _, n_lines, n_pages = make_source_doc(args.out, args.title)
+    make_info_sheet(args.out, args.title, n_lines, n_pages)
+
+
+if __name__ == "__main__":
+    main()
+
+[第 61 页]
+

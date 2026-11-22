@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+rdkit>=2023.03
+torch>=2.0
+flask>=2.3
+tqdm>=4.65
+matplotlib>=3.7
